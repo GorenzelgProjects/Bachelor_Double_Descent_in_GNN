@@ -130,7 +130,7 @@ def main():
                 checkpoint = torch.load(checkpoint_path)
                 start_i, start_j = i, j
                 checkpoint_found = True
-                print(f"Resuming training from k={k}, dataset fraction={j/10.0}, epoch {checkpoint['epoch'] + 1}")
+                print(f"Resuming training from k={k}, dataset fraction={j/3.0}, epoch {checkpoint['epoch'] + 1}")
                 break
         if checkpoint_found:
             break
@@ -140,8 +140,8 @@ def main():
         print(f"Training model with k={k}")
 
         # Iterate over different dataset sizes
-        for j in range(start_j if i == start_i else 1, 11):
-            dataset_fraction = j / 10.0
+        for j in range(start_j if i == start_i else 1, 4):
+            dataset_fraction = j / 3.0
             subset_size = int(len(trainset) * dataset_fraction)
             train_subset, _ = torch.utils.data.random_split(trainset, [subset_size, len(trainset) - subset_size])
             trainloader = torch.utils.data.DataLoader(train_subset, batch_size=128, shuffle=True, num_workers=2)
@@ -152,7 +152,8 @@ def main():
             # Initialize the model, criterion, and optimizer
             model = ResNet18k(k=k).to(device)  # Assuming the ResNet18k function accepts k as a parameter
             criterion = nn.CrossEntropyLoss()
-            optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+            #optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
 
             # Load checkpoint if available
             checkpoint_path = os.path.join(checkpoint_dir, f'mnist_checkpoint_k{k}_fraction{j}.pth')
