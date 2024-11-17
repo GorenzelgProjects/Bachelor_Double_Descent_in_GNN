@@ -1,0 +1,24 @@
+{
+    "model_type": "GCN",
+    "layer_range": {
+        "min": 2,
+        "max": 6,
+        "step": 1
+    },
+    "hidden_channels_range": {
+        "min": 8,
+        "max": 16,
+        "step": 8
+    },
+    "epoch_range": {
+        "min": 100,
+        "max": 100,
+        "step": 50
+    },
+    "activation_options": ["elu"],
+    "dropout": 0.0,
+    "num_heads": 2,
+    "learning_rate": 0.01,
+    "optimizer": "sgd",
+    "loss": "cross_entropy"
+}

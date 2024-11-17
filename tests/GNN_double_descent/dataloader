@@ -1,0 +1,14 @@
+import torch
+import torch_geometric
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import DataLoader
+
+def load_cora_dataset(batch_size=32):
+    dataset = Planetoid(root='/tmp/Cora', name='Cora')
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return loader
+
+if __name__ == "__main__":
+    loader = load_cora_dataset()
+    for data in loader:
+        print(data)
