@@ -1,2 +1,0 @@
-from double_descent_gnn.models.model import MyNeuralNet
-from double_descent_gnn.predict_model import predict

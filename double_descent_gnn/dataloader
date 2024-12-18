@@ -1,0 +1,22 @@
+import torch
+import torch_geometric
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import DataLoader
+
+def load_cora_dataset(batch_size=32):
+    dataset = Planetoid(root='/tmp/Cora', name='Cora')
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return loader
+
+def add_label_noise(labels, noise_level=0.1):
+    num_classes = labels.max().item() + 1
+    num_noise = int(noise_level * len(labels))
+    noise_idx = torch.randperm(len(labels))[:num_noise]
+    noise_labels = torch.randint(0, num_classes, (num_noise,))
+    labels[noise_idx] = noise_labels
+    return labels
+
+if __name__ == "__main__":
+    loader = load_cora_dataset()
+    for data in loader:
+        print(data)

@@ -1,0 +1,26 @@
+{
+    "model_type": "GAT",
+    "layer_range": {
+        "min": 4,
+        "max": 7,
+        "step": 1
+    },
+    "hidden_channels_range": {
+        "min": 1,
+        "max": 64,
+        "step": 1
+    },
+    "epoch_range": {
+        "min": 4000,
+        "max": 4000,
+        "step": 50
+    },
+    "activation_options": ["elu"],
+    "dropout": 0.0,
+    "num_heads": 2,
+    "save_interval": 10,
+    "learning_rate": 0.01,
+    "optimizer": "sgd",
+    "loss": "cross_entropy",
+    "output_path": "gnn_training_log_4"
+}
