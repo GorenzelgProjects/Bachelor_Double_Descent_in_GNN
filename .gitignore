@@ -177,3 +177,6 @@ cython_debug/
 #.idea/
 data_analysis/training_log.csv
 *.txt
+/data
+double_descent_deep_learning/checkpoints/training_log.csv
+double_descent_deep_learning/checkpoints/training_log.csv

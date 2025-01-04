@@ -13,11 +13,9 @@ class PreActBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(in_planes)
         self.conv1 = nn.Conv2d(
             in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.dout_1 = nn.Dropout(p=0.1)
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
                                stride=1, padding=1, bias=False)
-        self.dout_2 = nn.Dropout(p=0.1)
         if stride != 1 or in_planes != self.expansion*planes:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_planes, self.expansion*planes,
@@ -26,13 +24,10 @@ class PreActBlock(nn.Module):
 
     def forward(self, x):
         out = F.relu(self.bn1(x))
-        out = self.dout_1(out)
         shortcut = self.shortcut(out) if hasattr(self, 'shortcut') else x
         out = self.conv1(out)
         out = self.conv2(F.relu(self.bn2(out)))
-        out = self.dout_2(out)
         out += shortcut
-        
         return out
 
 class PreActResNet(nn.Module):
@@ -73,4 +68,7 @@ def make_resnet18k(k=64, num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
     return PreActResNet(PreActBlock, [2, 2, 2, 2], num_classes=num_classes, init_channels=k)
 
-print(make_resnet18k(64))
+if __name__ == '__main__':
+    model = make_resnet18k(64)
+    print(model)
+#print(make_resnet18k(64))

@@ -142,7 +142,7 @@ def main():
         if checkpoint_found:
             break
 
-    for i in range(start_i+55, 57):
+    for i in range(start_i+44, 58):
         k = 1 if i == 0 else i
         print(f"Training model with k={k}")
 
@@ -175,7 +175,7 @@ def main():
                 start_epoch = 0
 
             # Train the model
-            train_model(model, trainloader, testloader, criterion, optimizer, num_epochs=500, checkpoint_path=checkpoint_path, csv_file=csv_file, k=k, dataset_fraction=dataset_fraction)
+            train_model(model, trainloader, testloader, criterion, optimizer, num_epochs=1000, checkpoint_path=checkpoint_path, csv_file=csv_file, k=k, dataset_fraction=dataset_fraction)
 
 if __name__ == "__main__":
     main()
