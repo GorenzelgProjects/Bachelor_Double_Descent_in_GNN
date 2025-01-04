@@ -7,13 +7,18 @@ from resnet18k import make_resnet18k as ResNet18k   # Assuming resnet18k.py defi
 from cifar_label_noise_distribution import NoisyCIFAR10
 import os
 import csv
+import numpy as np
+
+#set seed
+torch.manual_seed(42)
+np.random.seed(42)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #print(f"Device: {device}")
 
 # Set parameters for dataset
-noise_rate = 0.2  # 20% of labels will be noisy
+noise_rate = 0.15  # 15% of labels will be noisy
 #batch_size = 64
 
 # Define transformations
@@ -28,13 +33,17 @@ def load_dataset(noise_rate=0.0, transform=transform):
     
     # Create noisy CIFAR-10 dataset
     trainset = NoisyCIFAR10(root='./data', train=True, transform=transform, noise_rate=noise_rate)
-    testset = NoisyCIFAR10(root='./data', train=False, transform=transform, noise_rate=noise_rate)
+    testset = NoisyCIFAR10(root='./data', train=False, transform=transform, noise_rate=0)
     
     return trainset, testset
 
 # Define training function
 def train_model(model, trainloader, testloader, criterion, optimizer, num_epochs, checkpoint_path, csv_file, k, dataset_fraction):
     start_epoch = 0
+    
+
+    # Initialize MSE loss criterion
+    mse_loss_criterion = nn.MSELoss()
     
     # Load checkpoint if available
     if os.path.exists(checkpoint_path):
@@ -49,11 +58,13 @@ def train_model(model, trainloader, testloader, criterion, optimizer, num_epochs
     with open(csv_file, 'a', newline='') as f:
         writer = csv.writer(f)
         if not csv_exists:
-            writer.writerow(['Model Size','Dataset Fraction', 'Epoch', 'Train Loss', 'Train Accuracy', 'Test Accuracy', 'Test Loss'])
+            writer.writerow(['Model Size', 'Dataset Fraction', 'Epoch', 'Train Loss', 'Train Accuracy', 
+                             'Test Accuracy', 'Test Loss', 'Train MSE Loss', 'Test MSE Loss'])
     
     for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
+        train_mse_loss = 0.0
         correct = 0
         total = 0
         for i, (inputs, labels) in enumerate(trainloader, 0):
@@ -68,23 +79,31 @@ def train_model(model, trainloader, testloader, criterion, optimizer, num_epochs
             loss.backward()
             optimizer.step()
 
+            
+            with torch.no_grad():
+                softmax_outputs = nn.functional.softmax(outputs, dim=1)  # Apply softmax to logits
+                labels_one_hot = nn.functional.one_hot(labels, num_classes=outputs.size(1)).float()
+                train_mse_loss += mse_loss_criterion(softmax_outputs, labels_one_hot).item()
+
             # Accumulate loss and accuracy
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-            if i % 100 == 99:  # Print every 100 mini-batches
-                print(f"Epoch {epoch + 1}, Batch {i + 1}, Loss: {running_loss / 100:.3f}")
-                running_loss = 0.0
+            #if i % 100 == 99:  # Print every 100 mini-batches
+            #    print(f"Epoch {epoch + 1}, Batch {i + 1}, Loss: {running_loss / 100:.3f}")
+            #    running_loss = 0.0
         
         train_loss = running_loss / len(trainloader)
+        train_mse_loss /= len(trainloader)
         train_accuracy = 100. * correct / total
-        print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.2f}%")
+        print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Train MSE Loss: {train_mse_loss:.4f}, Train Accuracy: {train_accuracy:.2f}%")
         
         # Evaluate on test set
         model.eval()
         test_loss = 0.0
+        test_mse_loss = 0.0
         correct = 0
         total = 0
         with torch.no_grad():
@@ -93,12 +112,21 @@ def train_model(model, trainloader, testloader, criterion, optimizer, num_epochs
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
                 test_loss += loss.item()
+                
+                # Compute MSE loss (not used for optimization)
+                softmax_outputs = nn.functional.softmax(outputs, dim=1)  # Apply softmax to logits
+                labels_one_hot = nn.functional.one_hot(labels, num_classes=outputs.size(1)).float()
+                test_mse_loss += mse_loss_criterion(softmax_outputs, labels_one_hot).item()
+
+
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
+
         test_loss /= len(testloader)
+        test_mse_loss /= len(testloader)
         test_accuracy = 100. * correct / total
-        print(f"Epoch {epoch + 1}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%")
+        print(f"Epoch {epoch + 1}, Test Loss: {test_loss:.4f}, Test MSE Loss: {test_mse_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%")
         
         # Save checkpoint at the end of each epoch
         torch.save({
@@ -111,12 +139,14 @@ def train_model(model, trainloader, testloader, criterion, optimizer, num_epochs
         # Log training progress to CSV file
         with open(csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([k, dataset_fraction, epoch + 1, train_loss, train_accuracy, test_accuracy, test_loss])
+            writer.writerow([k, dataset_fraction, epoch + 1, train_loss, train_accuracy, test_accuracy, test_loss, train_mse_loss, test_mse_loss])
 
 # Main function
 def main():
     # Create directory for checkpoints
-    checkpoint_dir = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/checkpoints'
+    #checkpoint_dir = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/checkpoints'
+    checkpoint_dir = '/work3/s214649/Bachelor_Double_Descent_in_GNN/double_descent_deep_learning/checkpoints'
+    #checkpoint_dir = './checkpoints'
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
@@ -142,14 +172,15 @@ def main():
         if checkpoint_found:
             break
 
-    for i in range(start_i+58, 65):
+    for i in range(start_i+54, 65):
         k = 1 if i == 0 else i
         print(f"Training model with k={k}")
 
         # Iterate over different dataset sizes
         for j in range(start_j if i == start_i else 1, 4):
             dataset_fraction = j / 3.0
-            trainset, testset = load_dataset()
+            trainset, testset = load_dataset(noise_rate=noise_rate)
+            #trainset, testset = load_dataset(noise_rate=0.0)
             subset_size = int(len(trainset) * dataset_fraction)
             train_subset, _ = torch.utils.data.random_split(trainset, [subset_size, len(trainset) - subset_size])
             trainloader = torch.utils.data.DataLoader(train_subset, batch_size=128, shuffle=True, num_workers=2)
