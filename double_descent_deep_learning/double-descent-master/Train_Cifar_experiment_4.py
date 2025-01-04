@@ -162,7 +162,7 @@ def main():
     for i in range(15,19):
         k = 1 if i == 0 else i
         for j in range(1, 11):
-            checkpoint_path = os.path.join(checkpoint_dir, f'cifar_checkpoint_k{k}_fraction{j}_experiment_1.pth')
+            checkpoint_path = os.path.join(checkpoint_dir, f'cifar_checkpoint_k{k}_fraction{j}_experiment_4.pth')
             if os.path.exists(checkpoint_path):
                 checkpoint = torch.load(checkpoint_path)
                 start_i, start_j = i, j
@@ -195,7 +195,7 @@ def main():
             optimizer = optim.Adam(model.parameters(), lr=0.0001)
 
             # Load checkpoint if available
-            checkpoint_path = os.path.join(checkpoint_dir, f'cifar_checkpoint_k{k}_fraction{j}_experiment_1.pth')
+            checkpoint_path = os.path.join(checkpoint_dir, f'cifar_checkpoint_k{k}_fraction{j}_experiment_4.pth')
             if os.path.exists(checkpoint_path) and use_checkpoint:
                 checkpoint = torch.load(checkpoint_path)
                 model.load_state_dict(checkpoint['model_state_dict'])
