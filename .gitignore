@@ -180,3 +180,5 @@ data_analysis/training_log.csv
 /data
 double_descent_deep_learning/checkpoints/training_log.csv
 double_descent_deep_learning/checkpoints/training_log.csv
+*.csv
+*.zip
