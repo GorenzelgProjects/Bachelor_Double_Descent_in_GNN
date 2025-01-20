@@ -1,16 +1,25 @@
 import json
 import torch
 import torch.nn.functional as F
-from models.conventional_models import GCN, GAT, GPRGNN
+from models.conventional_models import GCN, GAT, GraphSAGE, GPRGNN, BLOCK_APPNP
+from utils.custom_loader import OGBLoader
 from plot import Plotter
 import torch_geometric
 from torch_geometric.datasets import Planetoid
 from torch_geometric.loader import DataLoader
+#from ogb.graphproppred import PygGraphPropPredDataset
+from ogb.nodeproppred import PygNodePropPredDataset
+
 from torch_geometric.utils import to_dense_adj
 from madgap import MadGapRegularizer, MadValueCalculator
 import csv
 import os
 import numpy as np
+from oversmooth import OversmoothMeasure
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import inv
+
 #from dataloader import add_label_noise, load_cora_dataset
 
 from typing import Optional, Union
@@ -19,6 +28,10 @@ import torch
 import torch.linalg as TLA
 from torch import Tensor
 import argparse
+
+np.random.seed(42)
+torch.manual_seed(42)
+
 # Function to parse command line arguments
 def parse_args():
     parser = argparse.ArgumentParser(description="Model Wrapper for GNN with Hyperparameter Search")
@@ -65,20 +78,24 @@ class ModelWrapper:
                  hidden_channels, 
                  output_path, 
                  device, 
-                 mad_gap_regularizer,
-                 mad_value_calculator,
-                 adj_dict,
+                 measure,
                  save_interval,
                  ppnp, 
                  K, 
                  alpha, 
-                 dprate, 
+                 dprate,
+                 skip,
+                 use_ppr, 
                  **kwargs):
+        
+        
         # Dictionary mapping model names to their constructors
         self.model_constructors = {
             'GCN': GCN,
             'GAT': GAT,
+            'GRAPHSAGE': GraphSAGE,
             'GPRGNN': GPRGNN,
+            'BLOCK_APPNP': BLOCK_APPNP
         }
 
         # Initialize Plotter
@@ -91,14 +108,26 @@ class ModelWrapper:
         self.hidden_channels = hidden_channels
         self.output_path = output_path
         self.device = device
-        self.mad_gap_regularizer = mad_gap_regularizer
-        self.mad_value_calculator = mad_value_calculator
-        self.adj_dict = adj_dict
+        
+        self.mse_loss = F.mse_loss
+        
+        #self.mad_gap_regularizer = mad_gap_regularizer
+        #self.mad_value_calculator = mad_value_calculator
+        self.measure = measure
         self.save_interval = save_interval
         self.ppnp = ppnp
         self.K = K
         self.alpha = alpha
         self.dprate = dprate
+        self.skip = skip
+        
+        self.use_ppr = use_ppr
+        
+        if self.use_ppr:
+            adj_matrix = csr_matrix((np.ones(data.edge_index.shape[1]), (data.edge_index[0].numpy(), data.edge_index[1].numpy())), shape=(data.num_nodes, data.num_nodes))
+            self.ppr_matrix = compute_personalized_pagerank(adj_matrix, alpha=self.alpha, top_k=self.K)
+        else:
+            self.ppr_matrix = None
 
         # Store the arguments needed for model initialization
         self.model_kwargs = kwargs
@@ -136,14 +165,42 @@ class ModelWrapper:
         correct = (preds == labels).sum().item()
         accuracy = correct / len(labels)
         return accuracy
+    
+    def build_adj_mat(self, data):
+        hidden_representations = self.get_hidden_representations(data)
+        
+        # Create adjacency matrix based on graph structure
+        adjacency_matrix = torch.zeros((hidden_representations.shape[0], hidden_representations.shape[0]))
+        adjacency_matrix[data.edge_index[0], data.edge_index[1]] = 1
+        
+        
+        rmt_adjacency_matrix = torch.ones((hidden_representations.shape[0], hidden_representations.shape[0])) - adjacency_matrix
+        
+        adjacency_matrix = adjacency_matrix.cpu().numpy()
+        rmt_adjacency_matrix = rmt_adjacency_matrix.cpu().numpy()
+        
+        return adjacency_matrix, rmt_adjacency_matrix
+    
+    def get_hidden_representations(self, data):
+        self.model.eval()
+        with torch.no_grad():
+            #hidden_representations = model(data).detach().cpu().numpy()
+            try:
+                hidden_representations = self.model.forward_2(data.x.to(self.device), data.edge_index.to(self.device), self.ppr_matrix).detach().cpu().numpy()
+                
+            except:
+                hidden_representations = self.model(data.x.to(self.device), data.edge_index.to(self.device), self.ppr_matrix).detach().cpu().numpy()
+        
+        return hidden_representations
 
     def train(self, data, optimizer_name="adam", loss_name="cross_entropy", epochs=100, learning_rate=0.001, num_layers=2, hidden_channels=16):
+        
         # Get the optimizer and loss function based on names
         optimizer = self.get_optimizer(optimizer_name, learning_rate)
         loss_fn = self.get_loss_function(loss_name)
         
         # Also use a MSE loss
-        loss_MSE = F.mse_loss
+        #loss_MSE = F.mse_loss
         
         # ALso use a log_softmax loss
         loss_log_softmax = F.log_softmax
@@ -163,7 +220,7 @@ class ModelWrapper:
         # Training loop
         for epoch in range(epochs):
             optimizer.zero_grad()
-            out = self.model(data.x.to(self.device), data.edge_index.to(self.device))
+            out = self.model(data.x.to(self.device), data.edge_index.to(self.device), ppr_matrix=self.ppr_matrix)
             train_loss = loss_fn(out[data.train_mask.to(self.device)], data.y[data.train_mask].to(self.device))
             train_loss.backward()
             optimizer.step()
@@ -174,12 +231,13 @@ class ModelWrapper:
             # print dimensions of out and data.y
             #print(out.shape)
             #print(data.y.shape)
+
+                
             
             train_accuracy = self.calculate_accuracy(out[data.train_mask.to(self.device)], data.y[data.train_mask].to(self.device))
-            test_loss, test_accuracy = self.test(data, loss_name=loss_name)
             
             # Calculate the MadValue regularization term
-            out_np = out.detach().cpu().numpy()  # Convert tensor to numpy array
+            #out_np = out.detach().cpu().numpy()  # Convert tensor to numpy array
             #mad_value = self.mad_value_calculator(out)
             
             
@@ -196,15 +254,45 @@ class ModelWrapper:
                 
                 
             if (epoch+1) % self.save_interval == 0:
-                # Calculate the MadValue regularization term
-
-                mad_value = mean_average_distance(out, edge_index=data.edge_index, adj_dict=self.adj_dict, inverse=False)
+                # Get hidden representations
+                hidden_representations = self.get_hidden_representations(data)
+                #self.model.train()
+                
+                with torch.no_grad():
+                # make the labels one-hot
+                    out_mse = self.model.forward_2(data.x.to(self.device), data.edge_index.to(self.device), self.ppr_matrix)
+                    # Apply softmax to get probabilities
+                    out_mse = F.softmax(out_mse, dim=1)
+                    one_hot_labels = F.one_hot(data.y[data.train_mask].to(self.device), num_classes=out_mse.shape[1])
+                    train_mse_loss = self.mse_loss(out_mse[data.train_mask.to(self.device)], one_hot_labels.float())
+                    train_mse_loss = train_mse_loss.item()
+                    
+                test_loss, test_mse_loss, test_accuracy = self.test(data, out_mse, loss_name=loss_name)
+                
+                # Calculate the MadValue
+                mad_value = self.measure.get_mad_value(hidden_representations, self.adj_matrix, distance_metric='cosine', digt_num=4, target_idx=None)
+                
+                # Calculate the Mad_remote
+                mad_rmt = self.measure.get_mad_value(hidden_representations, self.rmt_adj_matrix, distance_metric='cosine', digt_num=4, target_idx=None)
+                
+                # Calculate the MadGap
+                madgap_value = round(float(mad_rmt - mad_value), 4)
+                
+                
+                # Calculate the Dirichlet Energy
+                dirichlet_energy = self.measure.get_dirichlet_energy(hidden_representations, self.adj_matrix)
+                dirichlet_energy = round(float(dirichlet_energy), 4)
+                
                 # Save the results to a CSV file
                 results = [
                     {"model_type": model_type, "layers": num_layers, "hidden_channels": hidden_channels, "epochs": epoch+1,
-                        "train_loss": train_loss_cpu, "train_accuracy": train_accuracy, "test_loss": test_loss, "test_accuracy": test_accuracy, "mad_value": mad_value},
+                        "train_loss": train_loss_cpu, "train_mse_loss": train_mse_loss, "train_accuracy": train_accuracy, 
+                        "test_loss": test_loss, "test_mse_loss": test_mse_loss, "test_accuracy": test_accuracy, 
+                        "mad_value": mad_value, "mad_gap": madgap_value, "dirichlet_energy": dirichlet_energy},
                 ]
                 save_training_results(self.output_path, results)
+                
+            
             
         #mad_value = mean_average_distance(out, edge_index=data.edge_index, adj_dict=self.adj_matrix, inverse=False)
         #print('MadValue_1:', mad_value)
@@ -217,7 +305,7 @@ class ModelWrapper:
         return best_train_loss
 
     
-    def test(self, data, loss_name="cross_entropy"):
+    def test(self, data, hidden_representations, loss_name="cross_entropy"):
         # Get the loss function based on name
         loss_fn = self.get_loss_function(loss_name)
 
@@ -226,11 +314,15 @@ class ModelWrapper:
 
         # Perform the forward pass for predictions
         with torch.no_grad():
-            out = self.model(data.x.to(self.device), data.edge_index.to(self.device))
+            out = self.model(data.x.to(self.device), data.edge_index.to(self.device), ppr_matrix=self.ppr_matrix)
             test_loss = loss_fn(out[data.test_mask.to(self.device)], data.y[data.test_mask].to(self.device))
             test_accuracy = self.calculate_accuracy(out[data.test_mask.to(self.device)], data.y[data.test_mask].to(self.device))
+            
+            # make the labels one-hot
+            one_hot_labels = F.one_hot(data.y[data.test_mask].to(self.device), num_classes=hidden_representations.shape[1])
+            test_mse_loss = self.mse_loss(hidden_representations[data.test_mask.to(self.device)], one_hot_labels.float())
 
-        return test_loss.item(), test_accuracy
+        return test_loss.item(), test_mse_loss.item(), test_accuracy
 
 
     def hyperparameter_search(self, data, layer_range, hidden_channels_range, epoch_range, activation_options, optimizer, loss, learning_rate, num_heads=None):
@@ -246,6 +338,9 @@ class ModelWrapper:
         num_layers_fixed = layer_range['min']
         hidden_channels_fixed = hidden_channels_range['min']
         epochs_fixed = epoch_range['min']
+        
+        # Get adjacency matrix & remote adjacency matrix
+        self.adj_matrix, self.rmt_adj_matrix = self.build_adj_mat(data)
 
         # Loop over activation functions
         for activation_str in activation_options:
@@ -282,13 +377,14 @@ class ModelWrapper:
                         self.hidden_channels = hidden_channels
                         self.model_kwargs['num_layers'] = num_layers
                         self.model_kwargs['activation'] = activation_fn
+                        self.model_kwargs['skip'] = self.skip
 
                         # Include num_heads if it's a GAT model
                         if self.model_name == 'GAT':
                             self.model_kwargs['num_heads'] = num_heads
                             
                         # Include extra for GPRGNN
-                        elif self.model_name == 'GPRGNN':
+                        elif self.model_name == 'GPRGNN' or self.model_name == 'BLOCK_APPNP':
                             self.model_kwargs['ppnp'] = self.ppnp
                             self.model_kwargs['K'] = self.K
                             self.model_kwargs['alpha'] = self.alpha
@@ -296,6 +392,8 @@ class ModelWrapper:
                         
                         # Rebuild the model with updated hyperparameters
                         self.model = self.build_model().to(self.device)
+                        
+                        #print('Model:', self.model)
 
                         # Train the model and get the best train loss
                         best_train_loss = self.train(data, 
@@ -307,7 +405,7 @@ class ModelWrapper:
                                                      hidden_channels=hidden_channels)
 
                         # Get the test loss and accuracy after training
-                        test_loss, test_accuracy = self.test(data, loss_name=loss)
+                        #test_loss, test_mse_loss, test_accuracy = self.test(data, loss_name=loss)
 
                         # Record the best train loss and the test loss for this configuration
                         #if vary_hidden_channels:
@@ -320,148 +418,6 @@ class ModelWrapper:
         # After the search is done, plot the results
         #self.plotter.plot()
 
-
-
-def build_adj_dict(num_nodes: int, edge_index: Tensor, inverse: bool) -> dict:
-    r"""A function to turn a list of edges (edge_index) into an adjacency list,
-    stored in a dictionary with vertex numbers as keys and lists of adjacent
-    nodes as values.
-
-    Args:
-        num_nodes (int): number of nodes
-        edge_index (torch.Tensor): edge list
-
-    :rtype: dict
-    """
-    # initialize adjacency dict with empty neighborhoods for all nodes
-    adj_dict: dict = {nodeid: [] for nodeid in range(num_nodes)}
-    
-    
-    if not inverse:
-        for eidx in range(edge_index.shape[1]):
-            ctail, chead = edge_index[0, eidx].item(), edge_index[1, eidx].item()
-
-            if chead not in adj_dict[ctail]:
-                adj_dict[ctail].append(chead)
-    
-    else:
-        for eidx in range(edge_index.shape[1]):
-            ctail, chead = edge_index[0, eidx].item(), edge_index[1, eidx].item()
-            
-            remote_nodes = [node for node in range(num_nodes) if node != ctail]
-            # remove all values from chead
-            remote_nodes = [node for node in remote_nodes if node != chead]
-            
-            adj_dict[ctail].append(remote_nodes)
-            
-            
-
-    return adj_dict
-
-
-@torch.no_grad()
-def dirichlet_energy(
-    feat_matrix: Tensor,
-    edge_index: Optional[Tensor] = None,
-    adj_dict: Optional[dict] = None,
-    p: Optional[Union[int, float]] = 2,
-    inverse: bool = False,
-) -> float:
-    r"""The 'Dirichlet Energy' node similarity measure from the
-    `"A Survey on Oversmoothing in Graph Neural Networks"
-    <https://arxiv.org/abs/2303.10993>`_ paper.
-
-    .. math::
-        \mu\left(\mathbf{X}^n\right) =
-        \sqrt{\mathcal{E}\left(\mathbf{X}^n\right)}
-
-    with
-
-    .. math::
-        \mathcal{E}(\mathbf{X}^n) = \mathrm{Ave}_{i\in \mathcal{V}}
-        \sum_{j \in \mathcal{N}_i} ||\mathbf{X}_{i}^n - \mathbf{X}_{j}^n||_p ^2
-
-    Args:
-        feat_matrix (torch.Tensor): The node feature matrix.
-        edge_index (torch.Tensor, optional): The edge list
-            (default: :obj:`None`)
-        adj_dict (dict, optional): The adjacency dictionary
-            (default: :obj:`None`)
-        p (int or float, optional): The order of the norm (default: :obj:`2`)
-
-    :rtype: float
-    """
-    num_nodes: int = feat_matrix.shape[0]
-    de: Tensor = torch.tensor(0, dtype=torch.float32)
-
-    if adj_dict is None:
-        if edge_index is None:
-            raise ValueError("Neither 'edge_index' nor 'adj_dict' was provided.")
-        adj_dict = build_adj_dict(num_nodes=num_nodes, edge_index=edge_index, inverse=inverse)
-
-    def inner(x_i: Tensor, x_js: Tensor) -> Tensor:
-        return TLA.vector_norm(x_i - x_js, ord=p, dim=1).square().sum()
-
-    for node_index in range(num_nodes):
-        own_feat_vector = feat_matrix[[node_index], :]
-        nbh_feat_matrix = feat_matrix[adj_dict[node_index], :]
-
-        de += inner(own_feat_vector, nbh_feat_matrix).cpu()
-
-    return torch.sqrt(de / num_nodes).item()
-
-
-@torch.no_grad()
-def mean_average_distance(
-    feat_matrix: Tensor,
-    edge_index: Optional[Tensor] = None,
-    adj_dict: Optional[dict] = None,
-    inverse: bool = False,
-) -> float:
-    r"""The 'Mean Average Distance' node similarity measure from the
-    `"A Survey on Oversmoothing in Graph Neural Networks"
-    <https://arxiv.org/abs/2303.10993>`_ paper.
-
-    .. math::
-        \mu(\mathbf{X}^n) = \mathrm{Ave}_{i\in \mathcal{V}}
-        \sum_{j \in \mathcal{N}_i}
-        \frac{{\mathbf{X}_i ^n}^\mathrm{T}\mathbf{X}_j ^n}
-        {||\mathbf{X}_i ^n|| ||\mathbf{X}_j^n||}
-
-    Args:
-        feat_matrix (torch.Tensor): The node feature matrix.
-        edge_index (torch.Tensor, optional): The edge list
-            (default: :obj:`None`)
-        adj_dict (dict, optional): The adjacency dictionary
-            (default: :obj:`None`)
-
-    :rtype: float
-    """
-    num_nodes: int = feat_matrix.shape[0]
-    mad: Tensor = torch.tensor(0, dtype=torch.float32)
-
-    if adj_dict is None:
-        if edge_index is None:
-            raise ValueError("Neither 'edge_index' nor 'adj_dict' was provided.")
-        adj_dict = build_adj_dict(num_nodes=num_nodes, edge_index=edge_index, inverse=inverse)
-        
-    # print the first 10 values of adj_dict
-    #print(list(adj_dict.items())[:10])
-
-    def inner(x_i: Tensor, x_js: Tensor) -> Tensor:
-        return (
-            1
-            - (x_i @ x_js.t())
-            / (TLA.vector_norm(x_i, ord=2) * TLA.vector_norm(x_js, ord=2, dim=1))
-        ).sum()
-
-    for node_index in range(num_nodes):
-        own_feat_vector = feat_matrix[[node_index], :]
-        nbh_feat_matrix = feat_matrix[adj_dict[node_index], :]
-
-        mad += inner(own_feat_vector, nbh_feat_matrix).cpu()
-
-    return (mad / num_nodes).item()
 
 # Function to load hyperparameters from the config file
 def load_hyperparameters(config_file):
@@ -476,7 +432,10 @@ def save_training_results(filename, results):
     file_exists = os.path.isfile(filename)
     
     with open(filename, 'a', newline='') as csvfile:
-        fieldnames = ['model_type', 'layers', "hidden_channels", "epochs", 'train_loss', 'train_accuracy', 'test_loss', 'test_accuracy', 'mad_value']
+        fieldnames = ['model_type', 'layers', "hidden_channels", "epochs", 
+                      'train_loss', 'train_mse_loss', 'train_accuracy', 
+                      'test_loss', 'test_mse_loss', 'test_accuracy', 
+                      'mad_value', 'mad_gap', 'dirichlet_energy']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
         if not file_exists:
@@ -507,6 +466,56 @@ def add_label_noise(labels, noise_level=0.1):
     labels[noise_idx] = noise_labels
     return labels
 
+def add_label_noise_multi_hot(labels, noise_level=0.1):
+    """
+    Add noise to multi-hot labels.
+    :param labels: A multi-hot tensor of shape (num_nodes, num_classes).
+    :param noise_level: Proportion of nodes to introduce noise to.
+    :return: Noisy labels with flipped bits.
+    """
+    # Determine the number of nodes and labels to corrupt
+    num_nodes, num_classes = labels.size()
+    num_noise = int(noise_level * num_nodes)
+    
+    # Randomly select nodes to introduce noise
+    noise_idx = torch.randperm(num_nodes)[:num_noise]
+    
+    # Flip random bits in the multi-hot labels
+    noisy_labels = labels.clone()
+    for idx in noise_idx:
+        # Select a random class index to flip
+        random_class = torch.randint(0, num_classes, (1,))
+        noisy_labels[idx, random_class] = 1 - noisy_labels[idx, random_class]
+    
+    return noisy_labels
+
+def compute_personalized_pagerank(adj_matrix, alpha=0.85, top_k=32):
+    """
+    Compute a sparse Personalized PageRank (PPR) matrix.
+    Args:
+        adj_matrix (scipy.sparse.csr_matrix): Adjacency matrix of the graph.
+        alpha (float): Teleport probability.
+        top_k (int): Number of top neighbors to retain per node.
+    Returns:
+        torch.Tensor: Sparse PPR matrix.
+    """
+    num_nodes = adj_matrix.shape[0]
+    degree_matrix = csr_matrix(np.diag(np.array(adj_matrix.sum(axis=1)).flatten()))
+    identity_matrix = csr_matrix(np.eye(num_nodes))
+    ppr_matrix = alpha * inv(identity_matrix - (1 - alpha) * inv(degree_matrix).dot(adj_matrix))
+
+    # Retain only top_k entries per row
+    for i in range(num_nodes):
+        row = ppr_matrix[i].toarray().flatten()
+        top_indices = np.argsort(row)[-top_k:]
+        mask = np.zeros_like(row, dtype=bool)
+        mask[top_indices] = True
+        row[~mask] = 0
+        ppr_matrix[i] = csr_matrix(row)
+
+    return torch.tensor(ppr_matrix.toarray(), dtype=torch.float)
+
+
 
 # Example usage
 if __name__ == "__main__":
@@ -516,8 +525,10 @@ if __name__ == "__main__":
         config_file = parse_args().config
         
     except SystemExit:
-        print("Error: Please provide the path to the configuration file using --config argument.")
-        exit(1)
+        #config_file = 'GNN_double_descent/config_1.json'
+        config_file = 'GNN_double_descent/configs/config_test.json'
+        
+        print('Using default config file:', config_file)
     
     hyperparams = load_hyperparameters(config_file)
     
@@ -527,83 +538,45 @@ if __name__ == "__main__":
     # Set the device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Assume we have a dataset (replace this with actual dataset)
-    #edge_index = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2]], dtype=torch.long)
-    #x = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], dtype=torch.float)
-    #y = torch.tensor([0, 1, 0, 1])  # Dummy labels
-    #train_mask = torch.tensor([True, True, False, False])
-    #test_mask = torch.tensor([False, False, True, True])
+    osm = OversmoothMeasure()
     
     # Load the Cora dataset
-    loader = load_cora_dataset(batch_size=32)
-    
-    edge_index = loader.dataset[0].edge_index
-    x = loader.dataset[0].x
-    y = loader.dataset[0].y
-    
-    y = add_label_noise(y, noise_level=0.1)
-    
-    train_mask = loader.dataset[0].train_mask
-    test_mask = loader.dataset[0].test_mask
-    
-    #print(edge_index.size())
-    #print(train_mask.size())
-    
-    # Generate neb_mask and rmt_mask for neighboring and remote relations
-    node_num = x.size(0)
-    
-    #print(node_num)
-    
-    adj_dict = build_adj_dict(num_nodes=node_num, edge_index=edge_index, inverse=False)
-    
-    #print(list(adj_dict.items())[2])
-    
-    #adj_dict_inverted = build_adj_dict(num_nodes=node_num, edge_index=edge_index, inverse=True)
-    
-    #print(list(adj_dict_inverted.items())[2])
-    
-    
-    neb_mask = torch.eye(node_num)  # Assume self-loops as neighbors for simplicity
-    #mask_arr = np.eye(node_num)  # Identity matrix for simplicity
-    rmt_mask = 1 - neb_mask  # Remote nodes as those not directly connected
-    
-    
-    adj_matrix = to_dense_adj(edge_index)
-    
-    # remove first dimension (1, num_nodes, num_nodes) to  (num_nodes, num_nodes)
-    adj_matrix = adj_matrix.squeeze(0)
-    
-    num_nodes = adj_matrix.size(0)
-    
-    #print(adj_matrix.size())
-    
-    # Initialize M_tgt as the adjacency matrix
-    # Option 1: If you want MAD for neighbors, use the adjacency matrix as-is
-    neighbor_mask = adj_matrix.clone().float()
-    
-    # Option 2: If you want MAD for remote nodes, use the complement of the adjacency matrix
-    #remote_mask = (1 - adj_matrix).float()
-
-    # Set the diagonal to zero for both masks (a node is not a neighbor or remote to itself)
-    neighbor_mask.fill_diagonal_(0)
-    #remote_mask.fill_diagonal_(0)
-    
-    # Convert the neighbor mask to a tensor
-    neighbor_mask = torch.tensor(neighbor_mask, dtype=torch.float).to(device)
-    
-    
-    # Create the mask array which should be the same size as the node_num * node_num and contains 1s for neighboring nodes and 0s for remote nodes which is given in the edge_index
-    mask_arr = np.zeros((node_num, node_num))
-    for i in range(edge_index.size(1)):
-        mask_arr[edge_index[0][i]][edge_index[1][i]] = 1
-        mask_arr[edge_index[1][i]][edge_index[0][i]] = 1
+    if hyperparams.get("dataset") == "cora":
+        loader = load_cora_dataset(batch_size=32)
         
-    # Convert the mask array to a tensor
-    #mask_arr = torch.tensor(mask_arr, dtype=torch.float).to(device)
+        edge_index = loader.dataset[0].edge_index
+        x = loader.dataset[0].x
+        y = loader.dataset[0].y
+        
+        y_train = y[loader.dataset[0].train_mask]
     
-
-    # Target indices (all nodes for this example)
-    target_idx = torch.arange(node_num)
+        # add label noise to the train labels
+        y_train = add_label_noise(y_train, noise_level=hyperparams.get("label_noise", 0.15))
+        
+        y[loader.dataset[0].train_mask] = y_train
+        
+        train_mask = loader.dataset[0].train_mask
+        test_mask = loader.dataset[0].test_mask
+        
+        
+    elif hyperparams.get("dataset") == "ogbn-proteins":
+        data_raw = torch.load("/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/GNN_double_descent/datasets/ogbn-proteins.pt")
+        dataset = OGBLoader(data_raw)
+        loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    #loader = load_cora_dataset(batch_size=32)
+    
+        edge_index = loader.dataset[0].edge_index
+        x = loader.dataset[0].x
+        y = loader.dataset[0].y
+        
+        y_train = y[loader.dataset[0].train_mask]
+        
+        # add label noise to the trains multi-hot labels
+        y_train = add_label_noise_multi_hot(y_train, noise_level=hyperparams.get("label_noise", 0.15))
+        y[loader.dataset[0].train_mask] = y_train
+    
+        train_mask = loader.dataset[0].train_mask
+        test_mask = loader.dataset[0].test_mask
     
     # Create the data object
     data = torch_geometric.data.Data(x=x, 
@@ -614,7 +587,15 @@ if __name__ == "__main__":
 
     # Dynamically set the number of input features and output channels based on data
     num_features = data.num_node_features  # Set dynamically based on the data
-    out_channels = len(set(data.y.numpy()))  # Number of unique labels
+    
+    
+    # print the first row of x
+    print(x[0])
+    
+    try:
+        out_channels = len(set(data.y.numpy()))  # Number of unique labels
+    except:
+        out_channels = data.y.size(1)
 
     # Get the model hyperparameters from the config file
     model_type = hyperparams["model_type"]
@@ -624,20 +605,9 @@ if __name__ == "__main__":
     alpha = hyperparams["alpha"]
     dprate = hyperparams["dprate"]
     
+    skip = True if hyperparams.get("skip")=="True" else False
+    ppr = True if hyperparams.get("ppr")=="True" else False
     
-    # Instantiate the MadValueCalculator
-    mad_value_calculator = MadValueCalculator(mask_arr=neighbor_mask, 
-                                              distance_metric='cosine', 
-                                              digt_num=4, 
-                                              target_idx=target_idx.numpy())
-
-    
-    # Create the MadGapRegularizer object
-    mad_gap_regularizer = MadGapRegularizer(neb_mask=neb_mask, 
-                                            rmt_mask=rmt_mask, 
-                                            target_idx=target_idx, 
-                                            weight=0.01,
-                                            device=device)
 
     # Instantiate the ModelWrapper with the loaded hyperparameters
     # Instantiate the ModelWrapper with the loaded hyperparameters
@@ -648,15 +618,15 @@ if __name__ == "__main__":
         hidden_channels=hyperparams['hidden_channels_range']['min'],# Start with the min hidden channels
         output_path=output_file, # Save the output to a file
         device=device,
-        mad_gap_regularizer=mad_gap_regularizer,  # Pass the MadGapRegularizer object
-        mad_value_calculator=mad_value_calculator,  # Pass the MadValueCalculator object
+        measure = osm,
         dropout=hyperparams.get("dropout", 0.5),  # Use dropout from config
-        adj_dict=adj_dict,
         save_interval=hyperparams.get("save_interval", 10),  # Save interval from config
         ppnp=ppnp,
         K=K,
         alpha=alpha,
-        dprate=dprate
+        dprate=dprate,
+        skip=skip,  # Use skip from config
+        use_ppr=ppr
     )
     
     # Perform hyperparameter search based on ranges from the config

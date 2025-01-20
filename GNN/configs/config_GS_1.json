@@ -1,0 +1,34 @@
+{
+    "model_type": "GRAPHSAGE",
+    "layer_range": {
+        "min": 2,
+        "max": 4,
+        "step": 1
+    },
+    "hidden_channels_range": {
+        "min": 1,
+        "max": 64,
+        "step": 1
+    },
+    "epoch_range": {
+        "min": 4000,
+        "max": 4000,
+        "step": 50
+    },
+    "activation_options": ["relu"],
+    "dropout": 0.0,
+    "num_heads": 2,
+    "label_noise": 0.15,
+    "save_interval": 10,
+    "learning_rate": 0.1,
+    "optimizer": "sgd",
+    "loss": "cross_entropy",
+    "output_path": "GS_MAD_training_log_1.csv",
+    "ppnp": "PPNP",
+    "K": 10,
+    "alpha": 0.1,
+    "dprate": 0.0,
+    "skip": "False",
+    "ppr": "False",
+    "dataset": "cora"
+}
