@@ -1,7 +1,7 @@
 import json
 import torch
 import torch.nn.functional as F
-from models.conventional_models import GCN, GAT, GraphSAGE, GPRGNN, BLOCK_APPNP
+from models.conventional_models import GCN, GAT, GraphSAGE, GPRGNN, BLOCK_APPNP, GCNGPP
 from utils.custom_loader import OGBLoader
 from plot import Plotter
 import torch_geometric
@@ -16,18 +16,26 @@ import csv
 import os
 import numpy as np
 from oversmooth import OversmoothMeasure
+from ogb.graphproppred import PygGraphPropPredDataset, Evaluator
 
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import inv
 
+from torch_geometric.datasets import TUDataset
+from sklearn.model_selection import train_test_split
+
 #from dataloader import add_label_noise, load_cora_dataset
 
 from typing import Optional, Union
+from torch_geometric.datasets import Actor, Airports
 
-import torch
+
 import torch.linalg as TLA
 from torch import Tensor
 import argparse
+
+#import builtins
+#builtins.input = lambda _: "y"  # Disable user prompts with default 'yes'
 
 np.random.seed(42)
 torch.manual_seed(42)
@@ -85,7 +93,9 @@ class ModelWrapper:
                  alpha, 
                  dprate,
                  skip,
-                 use_ppr, 
+                 use_ppr,
+                 gpp,
+                 evaluator,
                  **kwargs):
         
         
@@ -95,7 +105,9 @@ class ModelWrapper:
             'GAT': GAT,
             'GRAPHSAGE': GraphSAGE,
             'GPRGNN': GPRGNN,
-            'BLOCK_APPNP': BLOCK_APPNP
+            'BLOCK_APPNP': BLOCK_APPNP,
+            'GCNGPP': GCNGPP
+            
         }
 
         # Initialize Plotter
@@ -108,6 +120,8 @@ class ModelWrapper:
         self.hidden_channels = hidden_channels
         self.output_path = output_path
         self.device = device
+        self.gpp = gpp
+        self.evaluator = evaluator
         
         self.mse_loss = F.mse_loss
         
@@ -193,20 +207,13 @@ class ModelWrapper:
         
         return hidden_representations
 
+    
+    
     def train(self, data, optimizer_name="adam", loss_name="cross_entropy", epochs=100, learning_rate=0.001, num_layers=2, hidden_channels=16):
         
         # Get the optimizer and loss function based on names
         optimizer = self.get_optimizer(optimizer_name, learning_rate)
         loss_fn = self.get_loss_function(loss_name)
-        
-        # Also use a MSE loss
-        #loss_MSE = F.mse_loss
-        
-        # ALso use a log_softmax loss
-        loss_log_softmax = F.log_softmax
-        
-        # Also use a NLL loss
-        loss_NLL = F.nll_loss
         
         # get model type:
         model_type = self.model_name
@@ -228,32 +235,14 @@ class ModelWrapper:
             # train loss as a float
             train_loss_cpu = train_loss.item()
             
-            # print dimensions of out and data.y
-            #print(out.shape)
-            #print(data.y.shape)
-
-                
-            
             train_accuracy = self.calculate_accuracy(out[data.train_mask.to(self.device)], data.y[data.train_mask].to(self.device))
-            
-            # Calculate the MadValue regularization term
-            #out_np = out.detach().cpu().numpy()  # Convert tensor to numpy array
-            #mad_value = self.mad_value_calculator(out)
-            
-            
-            # Calculate the MadGap regularization term
-            #mad_gap_reg = self.mad_gap_regularizer(out)
-            #print('MadGap:', mad_gap_reg.item())
-            
-
-            #print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss.item()}, Train Accuracy: {train_accuracy}, Test Loss: {test_loss}, Test Accuracy: {test_accuracy}")
 
             # Update the best train loss
             if train_loss.item() < best_train_loss:
                 best_train_loss = train_loss.item()
                 
                 
-            if (epoch+1) % self.save_interval == 0:
+            if (epoch+1) % self.save_interval == 0 or epoch+1 < 10:
                 # Get hidden representations
                 hidden_representations = self.get_hidden_representations(data)
                 #self.model.train()
@@ -292,17 +281,130 @@ class ModelWrapper:
                 ]
                 save_training_results(self.output_path, results)
                 
-            
-            
-        #mad_value = mean_average_distance(out, edge_index=data.edge_index, adj_dict=self.adj_matrix, inverse=False)
-        #print('MadValue_1:', mad_value)
-        
-        #mad_value = self.mad_value_calculator(out)
-        #print('MadValue_2:', mad_value)
-        
-
-        # Return the best train loss for this run
         return best_train_loss
+    
+
+    
+    def eval(self, loader, loss_fn, test=False):
+        self.model.eval()
+
+        correct = 0
+        running_loss = 0.0
+        running_mse_loss = 0.0
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(self.device)
+
+                if batch.x.shape[0] == 1:
+                    pass
+                else:
+                        out = self.model(batch)
+                        pred = out.argmax(dim=1)
+                        correct += (pred == batch.y).sum().item()
+                        if test:
+                            running_loss += loss_fn(out, batch.y).item()
+                            one_hot_labels = F.one_hot(batch.y, num_classes=out.shape[1])
+                            # Apply softmax to get probabilities
+                            out_mse = F.softmax(out, dim=1)
+                            running_mse_loss += self.mse_loss(out_mse, one_hot_labels.float()).item()
+
+
+            
+            loss = running_loss / len(loader)
+            loss_mse = running_mse_loss / len(loader)
+            accuracy = correct / len(loader.dataset)
+
+        return accuracy, loss, loss_mse
+    
+
+    def train_gpp(self, data, optimizer_name="adam", loss_name="cross_entropy", epochs=100, learning_rate=0.001, num_layers=2, hidden_channels=16):
+        
+        # Get the optimizer and loss function based on names
+        optimizer = self.get_optimizer(optimizer_name, learning_rate)
+        loss_fn = self.get_loss_function(loss_name)
+        
+        # get model type:
+        model_type = self.model_name
+
+        # Set the model to training mode
+        self.model.train()
+        
+        train_loader, valid_loader, test_loader = data
+        
+        # Training loop
+        for epoch in range(epochs):
+            #print('Epoch:', epoch)
+            running_loss = 0.0
+            running_mse_loss = 0.0
+            for batch in train_loader:
+                
+                '''# Use batch.edge_index to create the adjacency matrix
+                adj_matrix = torch.zeros((batch.num_nodes, batch.num_nodes))
+                for i in range(batch.edge_index.shape[1]):
+                    adj_matrix[batch.edge_index[0, i], batch.edge_index[1, i]] = 1
+                    adj_matrix[batch.edge_index[1, i], batch.edge_index[0, i]] = 1
+                    
+                rmt_adj_matrix = torch.ones((batch.num_nodes, batch.num_nodes)) - adj_matrix
+                '''
+                batch = batch.to(device)
+
+                if batch.x.shape[0] == 1 or batch.batch[-1] == 0:
+                    pass
+                else:
+                    out = self.model(batch)
+                    optimizer.zero_grad()
+
+                    loss = loss_fn(out, batch.y)
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    running_loss += loss.item()
+                    
+                    
+                    with torch.no_grad():
+                    # Create one-hot labels
+                        one_hot_labels = F.one_hot(batch.y, num_classes=out.shape[1])
+                        # Apply softmax to get probabilities
+                        out_mse = F.softmax(out.to(torch.float32), dim=1)
+                        train_mse_loss = self.mse_loss(out_mse, one_hot_labels.float())
+                        train_mse_loss = train_mse_loss.item()
+                        running_mse_loss += train_mse_loss
+                    
+
+                    
+                    # Convert pred and adj_matrix to numpy
+                    #pred_cpu = out.detach().cpu().numpy()
+                    
+            loss = running_loss / len(train_loader)
+            loss_mse = running_mse_loss / len(train_loader)
+            #print('Training Loss:', loss, 'Training MSE Loss:', loss_mse)
+            
+            #test_accuracy, test_loss, test_loss_mse = self.eval(test_loader, loss_fn, test=True)
+            
+            # convert the value in dict test_accuracy to float
+            #test_accuracy = test_accuracy['acc']
+            #print(type(test_accuracy))
+            
+            if (epoch+1) % self.save_interval == 0 or epoch+1 < 10:
+                
+                train_accuracy, _, _ = self.eval(train_loader, loss_fn)
+                #train_accuracy = train_accuracy['acc']
+                
+                test_accuracy, test_loss, test_loss_mse = self.eval(test_loader, loss_fn, test=True)
+                #test_accuracy = test_accuracy['acc']
+                
+                
+                results = [
+                    {"model_type": model_type, "layers": num_layers, "hidden_channels": hidden_channels, "epochs": epoch+1,
+                        "train_loss": round(float(loss), 6), "train_mse_loss": round(float(loss_mse), 6), "train_accuracy": round(float(train_accuracy), 6), 
+                        "test_loss": round(float(test_loss), 6), "test_mse_loss": round(float(test_loss_mse), 6), "test_accuracy": round(float(test_accuracy), 6), 
+                        "mad_value": 0, "mad_gap": 0, "dirichlet_energy": 0},
+                ]
+                save_training_results(self.output_path, results)
+            
+        print('Training done')
+        return None
 
     
     def test(self, data, hidden_representations, loss_name="cross_entropy"):
@@ -323,9 +425,9 @@ class ModelWrapper:
             test_mse_loss = self.mse_loss(hidden_representations[data.test_mask.to(self.device)], one_hot_labels.float())
 
         return test_loss.item(), test_mse_loss.item(), test_accuracy
+    
 
-
-    def hyperparameter_search(self, data, layer_range, hidden_channels_range, epoch_range, activation_options, optimizer, loss, learning_rate, num_heads=None):
+    def hyperparameter_search(self, data, layer_range, hidden_channels_range, epoch_range, activation_options, optimizer, loss, learning_rate, gpp, num_heads=None):
         """
         Perform hyperparameter search by iterating only over the parameters where min and max values are different.
         """
@@ -340,7 +442,8 @@ class ModelWrapper:
         epochs_fixed = epoch_range['min']
         
         # Get adjacency matrix & remote adjacency matrix
-        self.adj_matrix, self.rmt_adj_matrix = self.build_adj_mat(data)
+        if not gpp:
+            self.adj_matrix, self.rmt_adj_matrix = self.build_adj_mat(data)
 
         # Loop over activation functions
         for activation_str in activation_options:
@@ -395,14 +498,23 @@ class ModelWrapper:
                         
                         #print('Model:', self.model)
 
-                        # Train the model and get the best train loss
-                        best_train_loss = self.train(data, 
-                                                     optimizer_name=optimizer, 
-                                                     loss_name=loss, 
-                                                     epochs=epochs, 
-                                                     learning_rate=learning_rate, 
-                                                     num_layers=num_layers, 
-                                                     hidden_channels=hidden_channels)
+                        if not self.gpp:
+                            # Train the model and get the best train loss
+                            best_train_loss = self.train(data, 
+                                                        optimizer_name=optimizer, 
+                                                        loss_name=loss, 
+                                                        epochs=epochs, 
+                                                        learning_rate=learning_rate, 
+                                                        num_layers=num_layers, 
+                                                        hidden_channels=hidden_channels)
+                        else:
+                            best_train_loss = self.train_gpp(data, 
+                                                        optimizer_name=optimizer, 
+                                                        loss_name=loss, 
+                                                        epochs=epochs, 
+                                                        learning_rate=learning_rate, 
+                                                        num_layers=num_layers, 
+                                                        hidden_channels=hidden_channels)
 
                         # Get the test loss and accuracy after training
                         #test_loss, test_mse_loss, test_accuracy = self.test(data, loss_name=loss)
@@ -453,8 +565,7 @@ def get_activation_function(activation_str):
     }
     return activations.get(activation_str, F.relu)  # Default to ReLU if not specified
 
-def load_cora_dataset(batch_size=32):
-    dataset = Planetoid(root='/tmp/Cora', name='Cora')
+def load_dataset(dataset, batch_size=32):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     return loader
 
@@ -466,28 +577,9 @@ def add_label_noise(labels, noise_level=0.1):
     labels[noise_idx] = noise_labels
     return labels
 
-def add_label_noise_multi_hot(labels, noise_level=0.1):
-    """
-    Add noise to multi-hot labels.
-    :param labels: A multi-hot tensor of shape (num_nodes, num_classes).
-    :param noise_level: Proportion of nodes to introduce noise to.
-    :return: Noisy labels with flipped bits.
-    """
-    # Determine the number of nodes and labels to corrupt
-    num_nodes, num_classes = labels.size()
-    num_noise = int(noise_level * num_nodes)
-    
-    # Randomly select nodes to introduce noise
-    noise_idx = torch.randperm(num_nodes)[:num_noise]
-    
-    # Flip random bits in the multi-hot labels
-    noisy_labels = labels.clone()
-    for idx in noise_idx:
-        # Select a random class index to flip
-        random_class = torch.randint(0, num_classes, (1,))
-        noisy_labels[idx, random_class] = 1 - noisy_labels[idx, random_class]
-    
-    return noisy_labels
+def add_zeros(data):
+    data.x = torch.zeros(data.num_nodes, dtype=torch.long)
+    return data
 
 def compute_personalized_pagerank(adj_matrix, alpha=0.85, top_k=32):
     """
@@ -521,12 +613,13 @@ def compute_personalized_pagerank(adj_matrix, alpha=0.85, top_k=32):
 if __name__ == "__main__":
     # Load hyperparameters from the config file
     checkpoint_dir = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/GNN_double_descent/checkpoints'
+    #checkpoint_dir = 'checkpoints'
     try:
         config_file = parse_args().config
         
     except SystemExit:
         #config_file = 'GNN_double_descent/config_1.json'
-        config_file = 'GNN_double_descent/configs/config_test.json'
+        config_file = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/GNN_double_descent/configs/config_test.json'
         
         print('Using default config file:', config_file)
     
@@ -542,7 +635,8 @@ if __name__ == "__main__":
     
     # Load the Cora dataset
     if hyperparams.get("dataset") == "cora":
-        loader = load_cora_dataset(batch_size=32)
+        dataset = Planetoid(root='/tmp/Cora', name='Cora')
+        loader = load_dataset(dataset=dataset, batch_size=32)
         
         edge_index = loader.dataset[0].edge_index
         x = loader.dataset[0].x
@@ -558,6 +652,139 @@ if __name__ == "__main__":
         train_mask = loader.dataset[0].train_mask
         test_mask = loader.dataset[0].test_mask
         
+        # Create the data object
+        data = torch_geometric.data.Data(x=x, 
+                                        edge_index=edge_index, 
+                                        y=y, 
+                                        train_mask=train_mask, 
+                                        test_mask=test_mask)
+
+        # Dynamically set the number of input features and output channels based on data
+        num_features = data.num_node_features  # Set dynamically based on the data
+        
+        evaluator = None
+        # print the first row of x
+        print(x[0])
+        
+        try:
+            out_channels = len(set(data.y.numpy()))  # Number of unique labels
+        except:
+            out_channels = data.y.size(1)
+            
+    elif hyperparams.get("dataset") == "airports":
+        #dataset = GitHub(root='/tmp/GitHub')
+        # Load the Actor dataset
+        dataset = Airports(root='path/to/dataset', name='usa')
+        data = dataset[0]  # Single graph
+        
+
+        # Step 2: Create Train/Validation/Test Masks
+        num_nodes = data.num_nodes
+
+        # Split indices into train, validation, and test
+        train_idx, test_idx = train_test_split(range(num_nodes), test_size=0.2, random_state=42)
+        train_idx, val_idx = train_test_split(train_idx, test_size=0.20, random_state=42)  # 20% test, 15% validation
+
+        print(f"Train: {len(train_idx)}, Validation: {len(val_idx)}, Test: {len(test_idx)}")
+
+        # Create masks
+        train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+        train_mask[train_idx] = True
+        val_mask[val_idx] = True
+        test_mask[test_idx] = True
+        
+        # print size of the masks
+        print('Train Mask:', train_mask.size())
+        print('Val Mask:', val_mask.size())
+        print('Test Mask:', test_mask.size())
+
+        # Add masks to the data object
+        data.train_mask = train_mask
+        data.val_mask = val_mask
+        data.test_mask = test_mask
+        
+        print(f"Dataset Info:\n{data}")
+        
+        loader = load_dataset(dataset=data, batch_size=32)
+        
+        edge_index = loader.dataset.edge_index
+        x = loader.dataset.x
+        y = loader.dataset.y
+        
+        
+        #print(loader.dataset)
+        
+        y_train = y[loader.dataset.train_mask]
+    
+        # add label noise to the train labels
+        y_train = add_label_noise(y_train, noise_level=hyperparams.get("label_noise", 0.15))
+        
+        y[loader.dataset.train_mask] = y_train
+        
+        train_mask = loader.dataset.train_mask
+        test_mask = loader.dataset.test_mask
+        
+        # Create the data object
+        data = torch_geometric.data.Data(x=x, 
+                                        edge_index=edge_index, 
+                                        y=y, 
+                                        train_mask=train_mask, 
+                                        test_mask=test_mask)
+
+        # Dynamically set the number of input features and output channels based on data
+        num_features = data.num_node_features  # Set dynamically based on the data
+        
+        evaluator = None
+        # print the first row of x
+        #print(x[0])
+        
+        try:
+            out_channels = len(set(data.y.numpy()))  # Number of unique labels
+        except:
+            out_channels = data.y.size(1)
+        
+    # Load the Cora dataset
+    elif hyperparams.get("dataset") == "citeseer":
+        dataset = Planetoid(root='/tmp/CiteSeer', name='CiteSeer')
+        loader = load_dataset(dataset=dataset, batch_size=32)
+        
+        edge_index = loader.dataset[0].edge_index
+        x = loader.dataset[0].x
+        y = loader.dataset[0].y
+        
+        print(loader.dataset[0])
+        
+        y_train = y[loader.dataset[0].train_mask]
+    
+        # add label noise to the train labels
+        y_train = add_label_noise(y_train, noise_level=hyperparams.get("label_noise", 0.15))
+        
+        y[loader.dataset[0].train_mask] = y_train
+        
+        train_mask = loader.dataset[0].train_mask
+        test_mask = loader.dataset[0].test_mask
+        
+        # Create the data object
+        data = torch_geometric.data.Data(x=x, 
+                                        edge_index=edge_index, 
+                                        y=y, 
+                                        train_mask=train_mask, 
+                                        test_mask=test_mask)
+
+        # Dynamically set the number of input features and output channels based on data
+        num_features = data.num_node_features  # Set dynamically based on the data
+        
+        evaluator = None
+        # print the first row of x
+        #print(x[0])
+        
+        try:
+            out_channels = len(set(data.y.numpy()))  # Number of unique labels
+        except:
+            out_channels = data.y.size(1)
         
     elif hyperparams.get("dataset") == "ogbn-proteins":
         data_raw = torch.load("/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/GNN_double_descent/datasets/ogbn-proteins.pt")
@@ -572,33 +799,68 @@ if __name__ == "__main__":
         y_train = y[loader.dataset[0].train_mask]
         
         # add label noise to the trains multi-hot labels
-        y_train = add_label_noise_multi_hot(y_train, noise_level=hyperparams.get("label_noise", 0.15))
+        #y_train = add_label_noise_multi_hot(y_train, noise_level=hyperparams.get("label_noise", 0.15))
         y[loader.dataset[0].train_mask] = y_train
     
         train_mask = loader.dataset[0].train_mask
         test_mask = loader.dataset[0].test_mask
-    
-    # Create the data object
-    data = torch_geometric.data.Data(x=x, 
-                                     edge_index=edge_index, 
-                                     y=y, 
-                                     train_mask=train_mask, 
-                                     test_mask=test_mask)
+        
+    elif hyperparams.get("dataset") == "mutag":
+        # Load MUTAG dataset
+        dataset = TUDataset(root="data/TUDataset", name="MUTAG")
 
-    # Dynamically set the number of input features and output channels based on data
-    num_features = data.num_node_features  # Set dynamically based on the data
+        # Split the dataset into train, validation, and test sets
+        train_idx, test_idx = train_test_split(range(len(dataset)), test_size=0.2, random_state=42)
+        train_idx, valid_idx = train_test_split(train_idx, test_size=0.2, random_state=42)
+
+        train_dataset = dataset[train_idx]
+        valid_dataset = dataset[valid_idx]
+        test_dataset = dataset[test_idx]
+
+        # Create data loaders
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        valid_loader = DataLoader(valid_dataset, batch_size=32, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        
+        data = [train_loader, valid_loader, test_loader]
+        
+        # Dynamically set the number of input features and output channels based on data
+        num_features = dataset.num_node_features  # Set dynamically based on the data
+        out_channels = dataset.num_classes  # Number of unique labels
+        
+        evaluator = None
+        
+    elif hyperparams.get("dataset") == "ogbg-ppa2":
+        print('Using ogbg-ppa dataset')
+        dataset_path = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/GNN_double_descent/dataset/ogbg_ppa'
+        dataset = PygGraphPropPredDataset(name = "ogbg-ppa", root=dataset_path, transform = add_zeros)
+        #dataset = PygGraphPropPredDataset(name = "ogbg-ppa", transform = add_zeros)
+
+        split_idx = dataset.get_idx_split()
+
+        ### automatic evaluator. takes dataset name as input
+        evaluator = Evaluator("ogbg-ppa")
+
+        #train_loader = DataLoader(dataset[split_idx["train"]], batch_size=32, shuffle=True, num_workers=0)
+        #valid_loader = DataLoader(dataset[split_idx["valid"]], batch_size=32, shuffle=False, num_workers=0)
+        #test_loader = DataLoader(dataset[split_idx["test"]], batch_size=32, shuffle=False, num_workers=0)
+        
+        train_loader = DataLoader(dataset[split_idx["train"]], batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+        valid_loader = DataLoader(dataset[split_idx["valid"]], batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+        test_loader = DataLoader(dataset[split_idx["test"]], batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+        
+        data = [train_loader, valid_loader, test_loader]
+
+        # Dynamically set the number of input features and output channels based on data
+        num_features = 1  # Set dynamically based on the data
+        out_channels = dataset.num_classes  # Number of unique labels
     
-    
-    # print the first row of x
-    print(x[0])
-    
-    try:
-        out_channels = len(set(data.y.numpy()))  # Number of unique labels
-    except:
-        out_channels = data.y.size(1)
+
 
     # Get the model hyperparameters from the config file
     model_type = hyperparams["model_type"]
+    
+    gpp = True if model_type=="GCNGPP" else False # Check if the model is a GCNGPP model
     
     ppnp = hyperparams["ppnp"]
     K = hyperparams["K"]
@@ -626,7 +888,9 @@ if __name__ == "__main__":
         alpha=alpha,
         dprate=dprate,
         skip=skip,  # Use skip from config
-        use_ppr=ppr
+        use_ppr=ppr,
+        gpp=gpp,
+        evaluator=evaluator
     )
     
     # Perform hyperparameter search based on ranges from the config
@@ -639,5 +903,6 @@ if __name__ == "__main__":
         optimizer=hyperparams["optimizer"],
         loss=hyperparams["loss"],
         learning_rate=hyperparams["learning_rate"],
-        num_heads=hyperparams.get("num_heads", 1)  # Use num_heads if it's a GAT model
+        num_heads=hyperparams.get("num_heads", 1),  # Use num_heads if it's a GAT model
+        gpp=gpp
     )

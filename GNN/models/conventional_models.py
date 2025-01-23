@@ -1,14 +1,17 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv, SAGEConv, global_add_pool
+from torch_geometric.nn import MessagePassing, GCNConv, GATConv, SAGEConv, APPNP
 import numpy as np
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch.nn import Parameter
 from torch.nn import Linear
-from torch_geometric.nn import JumpingKnowledge
-from torch_geometric.nn import MessagePassing, APPNP
+import torch.nn as nn
+from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool, GlobalAttention, Set2Set, JumpingKnowledge
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import inv
+from torch_geometric.nn.inits import uniform
+from torch_geometric.utils import degree
+import math
 
 
 class GCN(torch.nn.Module):
@@ -289,6 +292,8 @@ class GraphSAGE(torch.nn.Module):
 
         return x
     
+
+    
 class GPRGNN(torch.nn.Module):
     def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, ppnp='PPNP', K=10, alpha=0.1, dprate=0.0, skip=False, use_ppr=False):
         super(GPRGNN, self).__init__()
@@ -379,84 +384,273 @@ class BLOCK_APPNP(torch.nn.Module):
             
         return F.log_softmax(x, dim=1)
     
-class GCNGPP(nn.Module):
-    def __init__(self, num_features, hidden_channels, out_channels, num_layers=3, dropout=0.5, skip=True, use_ppr=True):
+    
+class GCNLayer(MessagePassing):
+    def __init__(self, emb_dim):
+        super(GCNLayer, self).__init__(aggr='add')
+
+        self.linear = torch.nn.Linear(emb_dim, emb_dim)
+        self.root_emb = torch.nn.Embedding(1, emb_dim)
+        self.edge_encoder = torch.nn.Linear(7, emb_dim)
+
+    def forward(self, x, edge_index, edge_attr):
+        x = self.linear(x)
+        edge_embedding = self.edge_encoder(edge_attr)
+
+        row, col = edge_index
+
+        #edge_weight = torch.ones((edge_index.size(1), ), device=edge_index.device)
+        deg = degree(row, x.size(0), dtype = x.dtype) + 1
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+
+        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+
+        return self.propagate(edge_index, x=x, edge_attr = edge_embedding, norm=norm) + F.relu(x + self.root_emb.weight) * 1./deg.view(-1,1)
+
+    def message(self, x_j, edge_attr, norm):
+        return norm.view(-1, 1) * F.relu(x_j + edge_attr)
+
+    def update(self, aggr_out):
+        return aggr_out
+    
+class GCNGPP(torch.nn.Module):
+    def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
         super(GCNGPP, self).__init__()
+        self.num_features = num_features
         self.num_layers = num_layers
+        self.activation = activation
         self.dropout = dropout
         self.skip = skip
         self.use_ppr = use_ppr
-
-        # Define GCN layers
+        # Initialize the first convolutional layer
+        
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GCNConv(num_features, hidden_channels))  # Input layer
-        for _ in range(num_layers - 2):
-            self.convs.append(GCNConv(hidden_channels, hidden_channels))  # Hidden layers
-        self.convs.append(GCNConv(hidden_channels, hidden_channels))  # Output GCN layer
+        self.convs.append(GCNConv(num_features, hidden_channels))
 
+        # Add intermediate convolutional layers if needed
+        for _ in range(num_layers - 2):
+            self.convs.append(GCNConv(hidden_channels, hidden_channels))
+
+        # Output layer
+        self.convs.append(GCNConv(hidden_channels, hidden_channels))
+        
+        if self.skip:
+            # Create a process layer.
+            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
+            
+        if self.use_ppr:
+            self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
+            torch.nn.init.xavier_uniform_(self.ppr_weight)
+        # Define GCN layers
+        
+        # Define a fully connected layer for graph classification
+        self.fc = torch.nn.Linear(hidden_channels, out_channels)
+        
+
+    def forward(self, data, ppr_matrix=None):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply GCN layers
+        if self.skip:
+            x_skip = self.preprocess(x)
+            
+        if self.use_ppr and ppr_matrix is not None:
+            ppr_features = ppr_matrix @ x
+            ppr_features = ppr_features @ self.ppr_weight    
+            
+        # Apply the GCN layers and the activation function
+        for conv in self.convs[:-1]:
+            x = conv(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            if self.skip:                
+                x = x + x_skip
+        
+        # Output layer (no activation applied here)
+        x = self.convs[-1](x, edge_index)
+        
+        # Combine with PPR features
+        if self.use_ppr and ppr_matrix is not None:
+            x = x + ppr_features
+
+        # Global mean pooling to aggregate node embeddings
+        x = global_mean_pool(x, batch)
+
+        # Fully connected layer for graph classification
+        x = self.fc(x)
+        return x
+    
+    def forward_2(self, data, ppr_matrix=None):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply GCN layers
+        if self.skip:
+            x_skip = self.preprocess(x)
+            
+        if self.use_ppr and ppr_matrix is not None:
+            ppr_features = ppr_matrix @ x
+            ppr_features = ppr_features @ self.ppr_weight    
+            
+        # Apply the GCN layers and the activation function
+        for conv in self.convs[:-1]:
+            x = conv(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            if self.skip:                
+                x = x + x_skip
+        
+        # Output layer (no activation applied here)
+        x = self.convs[-1](x, edge_index)
+        
+        # Combine with PPR features
+        if self.use_ppr and ppr_matrix is not None:
+            x = x + ppr_features
+
+        # Global mean pooling to aggregate node embeddings
+        x = global_mean_pool(x, batch)
+
+        # Fully connected layer for graph classification
+        x = self.fc(x)
+        return x
+    
+    
+
+'''
+class GCNGPP(torch.nn.Module):
+
+    def __init__(self, num_features=1, hidden_channels=64, out_channels=8, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
+        super(GCNGPP, self).__init__()
+
+        # Only for easy implementation (variable name change)
+        
+        num_layer = num_layers
+        emb_dim = hidden_channels
+        num_class = out_channels
+        drop_ratio = dropout
+        
+        residual = False
+        JK = "last"
+        graph_pooling = "mean"
+        
+        self.num_layer = num_layer
+        self.drop_ratio = drop_ratio
+        self.JK = JK
+        self.emb_dim = emb_dim
+        self.num_class = num_class
+        self.graph_pooling = graph_pooling
+        self.activation = activation
+
+        if self.num_layer < 2:
+            raise ValueError("Number of GNN layers must be greater than 1.")
+
+        ### GNN to generate node embeddings
+        #if virtual_node:
+            #self.gnn_node = GNN_node_Virtualnode(num_layer, emb_dim, JK = JK, drop_ratio = drop_ratio, residual = residual, gnn_type = gnn_type)
+        #else:
+            #self.gnn_node = GNN_node(num_layer, emb_dim, JK = JK, drop_ratio = drop_ratio, residual = residual, gnn_type = gnn_type)
+
+
+        ### Pooling function to generate whole-graph embeddings
+        if self.graph_pooling == "sum":
+            self.pool = global_add_pool
+        elif self.graph_pooling == "mean":
+            self.pool = global_mean_pool
+        elif self.graph_pooling == "max":
+            self.pool = global_max_pool
+        elif self.graph_pooling == "attention":
+            self.pool = GlobalAttention(gate_nn = torch.nn.Sequential(torch.nn.Linear(emb_dim, 2*emb_dim), torch.nn.BatchNorm1d(2*emb_dim), torch.nn.ReLU(), torch.nn.Linear(2*emb_dim, 1)))
+        elif self.graph_pooling == "set2set":
+            self.pool = Set2Set(emb_dim, processing_steps = 2)
+        else:
+            raise ValueError("Invalid graph pooling type.")
+
+        if graph_pooling == "set2set":
+            self.graph_pred_linear = torch.nn.Linear(2*self.emb_dim, self.num_class)
+        else:
+            self.graph_pred_linear = torch.nn.Linear(self.emb_dim, self.num_class)
+            
+            
+        self.num_layer = num_layer
+        self.drop_ratio = drop_ratio
+        self.JK = JK
+        ### add residual connection or not
+        self.residual = residual
+        
+        self.skip = skip
+        self.use_ppr = use_ppr
+
+        if self.num_layer < 2:
+            raise ValueError("Number of GNN layers must be greater than 1.")
+
+        self.node_encoder = torch.nn.Embedding(num_features, emb_dim) # uniform input node embedding
+
+        ###List of GNNs
+        self.convs = torch.nn.ModuleList()
+        self.batch_norms = torch.nn.ModuleList()
+
+        for layer in range(num_layer):
+
+            self.convs.append(GCNLayer(emb_dim))
+
+            self.batch_norms.append(torch.nn.BatchNorm1d(emb_dim))
+            
         # Preprocessing layer for skip connections
         if skip:
-            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
+            self.preprocess = create_ffn(emb_dim, emb_dim, drop_ratio)
 
         # PPR feature projection
         if use_ppr:
-            self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
+            self.ppr_weight = torch.nn.Parameter(torch.Tensor(emb_dim, emb_dim))
             torch.nn.init.xavier_uniform_(self.ppr_weight)
             
+            
 
-        # Final output layer
-        self.linear = torch.nn.Linear(hidden_channels, out_channels)
+    def forward(self, batched_data):
+        x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
 
-    def forward(self, x, edge_index, batch, ppr_matrix=None):
+
+        ### computing input node embedding
+
+        h_list = [self.node_encoder(x)]
+        
         if self.skip:
-            x_skip = self.preprocess(x)
+            x_skip = self.preprocess(self.node_encoder(x))
+        
+        for layer in range(self.num_layer):
 
-        if self.use_ppr and ppr_matrix is not None:
-            ppr_features = ppr_matrix @ x
-            ppr_features = ppr_features @ self.ppr_weight
+            h = self.convs[layer](h_list[layer], edge_index, edge_attr)
+            h = self.batch_norms[layer](h)
 
-        for conv in self.convs:
-            x = conv(x, edge_index)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+            if layer == self.num_layer - 1:
+                #remove relu for the last layer
+                h = F.dropout(h, self.drop_ratio, training = self.training)
+            else:
+                h = F.dropout(self.activation(h), self.drop_ratio, training = self.training)
+
+            if self.residual:
+                h += h_list[layer]
+            
             if self.skip:
-                x = x + x_skip
+                h += x_skip
 
-        if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
+            h_list.append(h)
 
-        # Pooling for graph-level representation
-        x = global_add_pool(x, batch)
+        ### Different implementations of Jk-concat
+        if self.JK == "last":
+            node_representation = h_list[-1]
+        elif self.JK == "sum":
+            node_representation = 0
+            for layer in range(self.num_layer + 1):
+                node_representation += h_list[layer]
 
-        # Final linear layer
-        x = self.linear(x)
-        return x
-    
-    def forward_2(self, x, edge_index, batch, ppr_matrix=None):
-        if self.skip:
-            x_skip = self.preprocess(x)
+        #return node_representation
 
-        if self.use_ppr and ppr_matrix is not None:
-            ppr_features = ppr_matrix @ x
-            ppr_features = ppr_features @ self.ppr_weight
+        h_graph = self.pool(node_representation, batch)
 
-        for conv in self.convs:
-            x = conv(x, edge_index)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            if self.skip:
-                x = x + x_skip
+        return self.graph_pred_linear(h_graph)
 
-        if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
-
-        # Pooling for graph-level representation
-        x = global_add_pool(x, batch)
-
-        # Final linear layer
-        x = self.linear(x)
-        return x
-    
+'''
     
 # FFN for skip connections
 def create_ffn(num_features, hidden_channels, dropout_rate):

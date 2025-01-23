@@ -23,7 +23,7 @@
     "learning_rate": 0.05,
     "optimizer": "sgd",
     "loss": "cross_entropy",
-    "output_path": "GS_training_log_2.csv",
+    "output_path": "GS_skip_training_log_2.csv",
     "ppnp": "PPNP",
     "K": 32,
     "alpha": 0.85,
