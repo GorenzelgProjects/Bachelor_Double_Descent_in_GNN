@@ -1,1 +1,19 @@
 torch >= 2.1.0
+numpy
+matplotlib
+scikit-learn
+pandas
+torch-geometric
+ogb
+prettytable
+wandb
+torchvision
+tqdm
+pickle
+tensorflow
+torchsummary
+tensorboard
+networkx
+fastdtw
+pytorch-lightning
+scipy
