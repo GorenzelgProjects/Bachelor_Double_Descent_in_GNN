@@ -27,7 +27,7 @@ This repository contains the code and resources for replicating the experiments 
 Ensure you have the following installed:
 
 - Python >= 3.8
-- [List any other specific dependencies, e.g., PyTorch, DGL, etc.]
+- The list of dependencies is found in requirements.txt
 
 ### Installation
 
