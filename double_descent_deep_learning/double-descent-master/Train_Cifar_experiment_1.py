@@ -144,9 +144,7 @@ def train_model(model, trainloader, testloader, criterion, optimizer, num_epochs
 # Main function
 def main():
     # Create directory for checkpoints
-    #checkpoint_dir = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/checkpoints'
-    checkpoint_dir = '/work3/s214649/Bachelor_Double_Descent_in_GNN/double_descent_deep_learning/checkpoints'
-    #checkpoint_dir = './checkpoints'
+    checkpoint_dir = './checkpoints'
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
@@ -159,9 +157,9 @@ def main():
     use_checkpoint = False
 
     # Check for existing checkpoints to resume
-    for i in range(15,19):
+    for i in range(start_i,26):
         k = 1 if i == 0 else i
-        for j in range(1, 11):
+        for j in range(1, 4):
             checkpoint_path = os.path.join(checkpoint_dir, f'cifar_checkpoint_k{k}_fraction{j}_experiment_1.pth')
             if os.path.exists(checkpoint_path):
                 checkpoint = torch.load(checkpoint_path)
