@@ -182,3 +182,16 @@ double_descent_deep_learning/checkpoints/training_log.csv
 double_descent_deep_learning/checkpoints/training_log.csv
 *.csv
 *.zip
+GNN/visualizations/cora.graphml
+GNN/visualizations/data/Planetoid/Cora/processed/data.pt
+GNN/visualizations/data/Planetoid/Cora/processed/pre_filter.pt
+GNN/visualizations/data/Planetoid/Cora/processed/pre_transform.pt
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.allx
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.ally
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.graph
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.test.index
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.tx
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.ty
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.x
+GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.y
+GNN/visualizations/save_as_graphml.ipynb
