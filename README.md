@@ -1,7 +1,7 @@
 
-# Research Code for [Double Descent in the context of GNN]
+# Research Code for Double Descent in the context of GNN
 
-Welcome to the repository for **[Double Descent in the context of GNN]**! This project is a research-based implementation of [brief description of research objective]. The code is designed to ensure replicability of experiments and facilitate further exploration.
+Welcome to the repository for **Double Descent in the context of GNN**! This project is a research-based implementation of our Bachelor's Thesis related to how GNNs generalize, which factors influence its generalization and if Double Descent appears in the context of GNNs. The code is designed to ensure replicability of experiments and facilitate further exploration.
 
 ## Table of Contents
 
