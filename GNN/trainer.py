@@ -144,7 +144,10 @@ class Trainer:
                                                     num_layers=num_layers, 
                                                     hidden_channels=hidden_channels)
                     else:
-                        pass
+                        best_train_loss = self.train_gpp(self.data, 
+                                                         epochs=epochs, 
+                                                         num_layers=num_layers, 
+                                                         hidden_channels=hidden_channels)
                     '''
                         best_train_loss = self.train_gpp(data, 
                                                     optimizer_name=optimizer, 
@@ -246,6 +249,113 @@ class Trainer:
             test_mse_loss = self.mw.mse_loss(hidden_representations[data.test_mask.to(self.device)], one_hot_labels.float())
 
         return test_loss.item(), test_mse_loss.item(), test_accuracy
+    
+    # Train the model for Graph Property Prediction
+    def train_gpp(self, data, epochs=100, num_layers=2, hidden_channels=16):
+        
+        # Get the optimizer and loss function based on names
+        optimizer = self.mw.optimizer
+        loss_fn = self.mw.loss
+        
+        # get model type:
+        model_type = self.model_name
+
+        # Set the model to training mode
+        self.mw.model.train()
+        
+        train_loader, valid_loader, test_loader = data
+        
+        # Training loop
+        for epoch in range(epochs):
+            #print('Epoch:', epoch)
+            running_loss = 0.0
+            running_mse_loss = 0.0
+            for batch in train_loader:
+                
+                '''# Use batch.edge_index to create the adjacency matrix
+                adj_matrix = torch.zeros((batch.num_nodes, batch.num_nodes))
+                for i in range(batch.edge_index.shape[1]):
+                    adj_matrix[batch.edge_index[0, i], batch.edge_index[1, i]] = 1
+                    adj_matrix[batch.edge_index[1, i], batch.edge_index[0, i]] = 1
+                    
+                rmt_adj_matrix = torch.ones((batch.num_nodes, batch.num_nodes)) - adj_matrix
+                '''
+                #batch = batch.to(torch.long())
+                # convert batch to long
+                
+                batch = batch.to(self.device)
+
+                if batch.x.shape[0] == 1 or batch.batch[-1] == 0:
+                    pass
+                else:
+                    out = self.mw.model(batch)
+                    optimizer.zero_grad()
+
+                    loss = loss_fn(out, batch.y)
+                    
+                    loss.backward()
+                    optimizer.step()
+                    
+                    running_loss += loss.item()
+                    
+                    with torch.no_grad():
+                    # Create one-hot labels
+                        one_hot_labels = F.one_hot(batch.y, num_classes=out.shape[1])
+                        # Apply softmax to get probabilities
+                        out_mse = F.softmax(out.to(torch.float32), dim=1)
+                        train_mse_loss = self.mw.mse_loss(out_mse, one_hot_labels.float())
+                        train_mse_loss = train_mse_loss.item()
+                        running_mse_loss += train_mse_loss
+                    
+            loss = running_loss / len(train_loader)
+            loss_mse = running_mse_loss / len(train_loader)
+            
+            if (epoch+1) % self.save_interval == 0 or epoch+1 < 10:
+                
+                train_accuracy, _, _ = self.eval(train_loader, loss_fn)
+                
+                test_accuracy, test_loss, test_loss_mse = self.eval(test_loader, loss_fn, test=True)
+                    
+                results = [
+                    {"model_type": model_type, "layers": num_layers, "hidden_channels": hidden_channels, "epochs": epoch+1,
+                        "train_loss": round(float(loss), 6), "train_mse_loss": round(float(loss_mse), 6), "train_accuracy": round(float(train_accuracy), 6), 
+                        "test_loss": round(float(test_loss), 6), "test_mse_loss": round(float(test_loss_mse), 6), "test_accuracy": round(float(test_accuracy), 6), 
+                        "mad_value": 0, "mad_gap": 0, "dirichlet_energy": 0},
+                ]
+                self.save_training_results(results)
+            
+        print('Training done')
+        return None
+    
+    # Evaluate the model for Graph Property Prediction
+    def eval(self, loader, loss_fn, test=False):
+        self.mw.model.eval()
+
+        correct = 0
+        running_loss = 0.0
+        running_mse_loss = 0.0
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(self.device)
+
+                if batch.x.shape[0] == 1:
+                    pass
+                else:
+                        out = self.mw.model(batch)
+                        pred = out.argmax(dim=1)
+                        correct += (pred == batch.y).sum().item()
+                        if test:
+                            running_loss += loss_fn(out, batch.y).item()
+                            one_hot_labels = F.one_hot(batch.y, num_classes=out.shape[1])
+                            # Apply softmax to get probabilities
+                            out_mse = F.softmax(out, dim=1)
+                            running_mse_loss += self.mw.mse_loss(out_mse, one_hot_labels.float()).item()
+            
+            loss = running_loss / len(loader)
+            loss_mse = running_mse_loss / len(loader)
+            accuracy = correct / len(loader.dataset)
+
+        return accuracy, loss, loss_mse
     
     def calculate_accuracy(self, logits, labels):
         _, preds = torch.max(logits, dim=1)
