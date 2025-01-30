@@ -195,3 +195,11 @@ GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.ty
 GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.x
 GNN/visualizations/data/Planetoid/Cora/raw/ind.cora.y
 GNN/visualizations/save_as_graphml.ipynb
+double_descent_deep_learning/data/cifar-10-batches-py/batches.meta
+double_descent_deep_learning/data/cifar-10-batches-py/data_batch_1
+double_descent_deep_learning/data/cifar-10-batches-py/data_batch_2
+double_descent_deep_learning/data/cifar-10-batches-py/data_batch_3
+double_descent_deep_learning/data/cifar-10-batches-py/data_batch_4
+double_descent_deep_learning/data/cifar-10-batches-py/data_batch_5
+double_descent_deep_learning/data/cifar-10-batches-py/test_batch
+double_descent_deep_learning/data/cifar-10-batches-py/readme.html

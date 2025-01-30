@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-from resnet18k import make_resnet18k as ResNet18k   # Assuming resnet18k.py defines this model
-from cifar_label_noise_distribution import NoisyCIFAR10
+from utils.resnet18k import make_resnet18k as ResNet18k   # Assuming resnet18k.py defines this model
+from utils.cifar_label_noise_distribution import NoisyCIFAR10
 import os
 import csv
 import numpy as np
