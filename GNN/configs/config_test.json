@@ -1,5 +1,5 @@
 {
-    "model_type": "GCN",
+    "model_type": "GRAPHSAGE",
     "layer_range": {
         "min": 2,
         "max": 2,
@@ -7,12 +7,12 @@
     },
     "hidden_channels_range": {
         "min": 1,
-        "max": 1,
+        "max": 16,
         "step": 1
     },
     "epoch_range": {
-        "min": 200,
-        "max": 200,
+        "min": 1,
+        "max": 1,
         "step": 50
     },
     "activation_options": ["relu"],
@@ -20,15 +20,21 @@
     "num_heads": 2,
     "label_noise": 0.15,
     "save_interval": 10,
-    "learning_rate": 0.05,
-    "optimizer": "sgd",
+    "learning_rate": 0.01,
+    "batch_size": 32,
+    "data_shuffle": "True",
+    "test_size": 0.2,
+    "val_size": 0.1,
+    "random_seed": 42,
+    "optimizer": "adam",
     "loss": "cross_entropy",
     "output_path": "test_training_log_1.csv",
     "ppnp": "PPNP",
-    "K": 10,
-    "alpha": 0.1,
+    "K": 32,
+    "alpha": 0.85,
     "dprate": 0.0,
     "skip": "False",
     "ppr": "False",
+    "raw_data_path": "None",
     "dataset": "cora"
 }

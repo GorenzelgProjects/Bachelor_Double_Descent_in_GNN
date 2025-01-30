@@ -1,7 +1,7 @@
 import json
 import torch
 import torch.nn.functional as F
-from models.conventional_models import GCN, GAT, GraphSAGE, GPRGNN, BLOCK_APPNP, GCNGPP
+from models.conventional_models import GCN, GAT, GraphSAGE, GPRGNN, BLOCK_APPNP, GCNGPP, GSGPP, GATGPP
 from utils.custom_loader import OGBLoader
 from plot import Plotter
 import torch_geometric
@@ -9,11 +9,12 @@ from torch_geometric.datasets import Planetoid
 from torch_geometric.loader import DataLoader
 #from ogb.graphproppred import PygGraphPropPredDataset
 from ogb.nodeproppred import PygNodePropPredDataset
-
+import random
 from torch_geometric.utils import to_dense_adj
 from madgap import MadGapRegularizer, MadValueCalculator
 import csv
 import os
+from scipy import sparse
 import numpy as np
 from oversmooth import OversmoothMeasure
 from ogb.graphproppred import PygGraphPropPredDataset, Evaluator
@@ -106,8 +107,9 @@ class ModelWrapper:
             'GRAPHSAGE': GraphSAGE,
             'GPRGNN': GPRGNN,
             'BLOCK_APPNP': BLOCK_APPNP,
-            'GCNGPP': GCNGPP
-            
+            'GCNGPP': GCNGPP,
+            'GSGPP': GSGPP,
+            'GATGPP': GATGPP
         }
 
         # Initialize Plotter
@@ -160,7 +162,7 @@ class ModelWrapper:
     
     def get_optimizer(self, optimizer_name, learning_rate):
         if optimizer_name == "adam":
-            return torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+            return torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=5e-4)
         elif optimizer_name == "sgd":
             return torch.optim.SGD(self.model.parameters(), lr=learning_rate)
         else:
@@ -346,6 +348,9 @@ class ModelWrapper:
                     
                 rmt_adj_matrix = torch.ones((batch.num_nodes, batch.num_nodes)) - adj_matrix
                 '''
+                #batch = batch.to(torch.long())
+                # convert batch to long
+                
                 batch = batch.to(device)
 
                 if batch.x.shape[0] == 1 or batch.batch[-1] == 0:
@@ -495,8 +500,9 @@ class ModelWrapper:
                         
                         # Rebuild the model with updated hyperparameters
                         self.model = self.build_model().to(self.device)
-                        
-                        #print('Model:', self.model)
+                        #total_params = count_parameters(self.model)
+                        #result = {"model_type": self.model_name, "layers": num_layers, "hidden_channels": hidden_channels, "params": total_params}
+                        #save_params_as_csv([result], 'GS_normal.csv')
 
                         if not self.gpp:
                             # Train the model and get the best train loss
@@ -529,6 +535,43 @@ class ModelWrapper:
 
         # After the search is done, plot the results
         #self.plotter.plot()
+        
+
+
+#from prettytable import PrettyTable
+
+def count_parameters(model):
+    #table = PrettyTable(["Modules", "Parameters"])
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        params = parameter.numel()
+        #table.add_row([name, params])
+        total_params += params
+    #print(table)
+    #print(f"Total Trainable Params: {total_params}")
+    return total_params
+
+def save_params_as_csv(result, output_path):
+    base_path = '/dtu/blackhole/10/141264/Bachelor_Double_Descent_in_GNN/GNN_double_descent/params'
+    output_path = os.path.join(base_path, output_path)
+    
+    # if the file does not exist, create it and write the header
+    if not os.path.exists(output_path):
+        with open(output_path, 'w', newline='') as csvfile:
+            fieldnames = ['model_type', 'layers', "hidden_channels", "params"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in result:
+                writer.writerow(row)
+    else:
+        with open(output_path, 'a', newline='') as csvfile:
+            fieldnames = ['model_type', 'layers', "hidden_channels", "params"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            for row in result:
+                writer.writerow(row)
+    
 
 
 # Function to load hyperparameters from the config file
@@ -577,6 +620,19 @@ def add_label_noise(labels, noise_level=0.1):
     labels[noise_idx] = noise_labels
     return labels
 
+# Add label noise
+def add_label_noise_mutag(dataset, noise_level):
+    num_samples = len(dataset)
+    num_noisy_samples = int(noise_level * num_samples)
+    # Randomly select indices to flip labels
+    noisy_indices = random.sample(range(num_samples), num_noisy_samples)
+    
+    # Flip the labels at the selected indices
+    for idx in noisy_indices:
+        dataset[idx].y = 1 - dataset[idx].y  # Flip label (assuming binary labels: 0 or 1)
+        
+    return dataset
+
 def add_zeros(data):
     data.x = torch.zeros(data.num_nodes, dtype=torch.long)
     return data
@@ -591,6 +647,8 @@ def compute_personalized_pagerank(adj_matrix, alpha=0.85, top_k=32):
     Returns:
         torch.Tensor: Sparse PPR matrix.
     """
+    adj_matrix += 1e-10 * sparse.eye(adj_matrix.shape[0])
+    
     num_nodes = adj_matrix.shape[0]
     degree_matrix = csr_matrix(np.diag(np.array(adj_matrix.sum(axis=1)).flatten()))
     identity_matrix = csr_matrix(np.eye(num_nodes))
@@ -642,6 +700,8 @@ if __name__ == "__main__":
         x = loader.dataset[0].x
         y = loader.dataset[0].y
         
+        print('Edge Index:', edge_index.size())
+        
         y_train = y[loader.dataset[0].train_mask]
     
         # add label noise to the train labels
@@ -652,12 +712,18 @@ if __name__ == "__main__":
         train_mask = loader.dataset[0].train_mask
         test_mask = loader.dataset[0].test_mask
         
+        print('train_nodes', train_mask.size())
+        print('test_nodes', test_mask.size())
+        
+        
         # Create the data object
         data = torch_geometric.data.Data(x=x, 
                                         edge_index=edge_index, 
                                         y=y, 
                                         train_mask=train_mask, 
                                         test_mask=test_mask)
+
+        print(f"Dataset Info:\n{data}")
 
         # Dynamically set the number of input features and output channels based on data
         num_features = data.num_node_features  # Set dynamically based on the data
@@ -711,6 +777,9 @@ if __name__ == "__main__":
         loader = load_dataset(dataset=data, batch_size=32)
         
         edge_index = loader.dataset.edge_index
+        
+        print('Edge Index:', edge_index.size())
+        
         x = loader.dataset.x
         y = loader.dataset.y
         
@@ -808,19 +877,31 @@ if __name__ == "__main__":
     elif hyperparams.get("dataset") == "mutag":
         # Load MUTAG dataset
         dataset = TUDataset(root="data/TUDataset", name="MUTAG")
+        
+        #print(dataset[0])
 
         # Split the dataset into train, validation, and test sets
         train_idx, test_idx = train_test_split(range(len(dataset)), test_size=0.2, random_state=42)
         train_idx, valid_idx = train_test_split(train_idx, test_size=0.2, random_state=42)
 
+        #print(f"Train: {len(train_idx)}, Validation: {len(valid_idx)}, Test: {len(test_idx)}")
+        
+        #print('Train:', train_idx)
+        #print('Valid:', valid_idx)
+        #print('Test:', test_idx)
+
         train_dataset = dataset[train_idx]
         valid_dataset = dataset[valid_idx]
         test_dataset = dataset[test_idx]
+        
+        #print(test_dataset.y)
+        
+        train_dataset = add_label_noise_mutag(train_dataset, noise_level=hyperparams.get("label_noise", 0.15))
 
         # Create data loaders
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        valid_loader = DataLoader(valid_dataset, batch_size=32, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+        valid_loader = DataLoader(valid_dataset, batch_size=4, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False)
         
         data = [train_loader, valid_loader, test_loader]
         
@@ -860,7 +941,7 @@ if __name__ == "__main__":
     # Get the model hyperparameters from the config file
     model_type = hyperparams["model_type"]
     
-    gpp = True if model_type=="GCNGPP" else False # Check if the model is a GCNGPP model
+    gpp = True if model_type=="GCNGPP" or model_type=="GSGPP" or model_type=="GATGPP" else False # Check if the model is a GCNGPP model
     
     ppnp = hyperparams["ppnp"]
     K = hyperparams["K"]

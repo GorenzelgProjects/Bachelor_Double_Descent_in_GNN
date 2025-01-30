@@ -30,14 +30,17 @@ class GCN(torch.nn.Module):
             torch.Tensor: Output tensor after passing through the GCN layers.
     """
     
-    def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
-        super(GCN, self).__init__()
-        self.num_features = num_features
-        self.num_layers = num_layers
-        self.activation = activation
-        self.dropout = dropout
-        self.skip = skip
-        self.use_ppr = use_ppr
+    def __init__(self, **kwargs):
+        super(GCN, self).__init__() 
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        self.activation = kwargs.get("activation", F.relu)
+        self.dropout = kwargs.get("dropout", 0.0)
+        self.skip = kwargs.get("skip", False)
+        self.use_ppr = kwargs.get("use_ppr", False)
+        hidden_channels = kwargs.get("hidden_channels", 64)
         # Initialize the first convolutional layer
         self.convs = torch.nn.ModuleList()
         self.convs.append(GCNConv(num_features, hidden_channels))
@@ -51,7 +54,7 @@ class GCN(torch.nn.Module):
         
         if self.skip:
             # Create a process layer.
-            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
+            self.preprocess = create_ffn(num_features, hidden_channels, self.dropout)
             
         if self.use_ppr:
             self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
@@ -129,8 +132,19 @@ class GAT(torch.nn.Module):
             torch.Tensor: Output tensor after passing through the GAT layers.
     """
 
-    def __init__(self, num_features, hidden_channels, out_channels, num_heads=1, num_layers=2, activation=F.elu, dropout=0.0, skip=False, use_ppr=False):
+    def __init__(self, **kwargs):
         super(GAT, self).__init__()
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        activation = kwargs.get("activation", F.elu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        num_heads = kwargs.get("num_heads", 1)
+        
         self.num_features = num_features
         self.num_layers = num_layers
         self.activation = activation
@@ -214,8 +228,18 @@ class GraphSAGE(torch.nn.Module):
             torch.Tensor: Output tensor after passing through the GraphSAGE layers.
     """
 
-    def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
+    def __init__(self, **kwargs):
         super(GraphSAGE, self).__init__()
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        activation = kwargs.get("activation", F.relu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        
         self.num_features = num_features
         self.hidden_channels = hidden_channels
         self.out_channels = out_channels
@@ -295,8 +319,22 @@ class GraphSAGE(torch.nn.Module):
 
     
 class GPRGNN(torch.nn.Module):
-    def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, ppnp='PPNP', K=10, alpha=0.1, dprate=0.0, skip=False, use_ppr=False):
+    def __init__(self, **kwargs):
         super(GPRGNN, self).__init__()
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        activation = kwargs.get("activation", F.relu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        ppnp = kwargs.get("ppnp", 'PPNP')
+        K = kwargs.get("K", 10)
+        alpha = kwargs.get("alpha", 0.1)
+        dprate = dropout
+        
         
         self.skip = skip
         self.use_ppr = use_ppr
@@ -340,8 +378,22 @@ class GPRGNN(torch.nn.Module):
             return F.log_softmax(x, dim=1)
         
 class BLOCK_APPNP(torch.nn.Module):
-    def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, ppnp='PPNP', K=10, alpha=0.1, dprate=0.0, skip=False, use_ppr=False):
+    def __init__(self, **kwargs):
         super(BLOCK_APPNP, self).__init__()
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        activation = kwargs.get("activation", F.relu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        ppnp = kwargs.get("ppnp", 'PPNP')
+        K = kwargs.get("K", 10)
+        alpha = kwargs.get("alpha", 0.1)
+        dprate = dropout
+        
         
         self.skip = skip
         self.gprgnn_layers = torch.nn.ModuleList()
@@ -391,7 +443,7 @@ class GCNLayer(MessagePassing):
 
         self.linear = torch.nn.Linear(emb_dim, emb_dim)
         self.root_emb = torch.nn.Embedding(1, emb_dim)
-        self.edge_encoder = torch.nn.Linear(7, emb_dim)
+        self.edge_encoder = torch.nn.Linear(4, emb_dim)
 
     def forward(self, x, edge_index, edge_attr):
         x = self.linear(x)
@@ -413,7 +465,7 @@ class GCNLayer(MessagePassing):
 
     def update(self, aggr_out):
         return aggr_out
-    
+'''
 class GCNGPP(torch.nn.Module):
     def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
         super(GCNGPP, self).__init__()
@@ -426,14 +478,137 @@ class GCNGPP(torch.nn.Module):
         # Initialize the first convolutional layer
         
         self.convs = torch.nn.ModuleList()
+        self.batch_norms = torch.nn.ModuleList()
+        
         self.convs.append(GCNConv(num_features, hidden_channels))
-
+        self.batch_norms.append(torch.nn.BatchNorm1d(hidden_channels))
+        
+        
         # Add intermediate convolutional layers if needed
         for _ in range(num_layers - 2):
             self.convs.append(GCNConv(hidden_channels, hidden_channels))
+            self.batch_norms.append(torch.nn.BatchNorm1d(hidden_channels))
 
         # Output layer
         self.convs.append(GCNConv(hidden_channels, hidden_channels))
+        self.batch_norms.append(torch.nn.BatchNorm1d(hidden_channels))
+        
+        if self.skip:
+            # Create a process layer.
+            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
+            
+        if self.use_ppr:
+            self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
+            torch.nn.init.xavier_uniform_(self.ppr_weight)
+        # Define GCN layers
+        
+        # Define a fully connected layer for graph classification
+        self.fc = torch.nn.Linear(hidden_channels, out_channels)
+        
+
+    def forward(self, data, ppr_matrix=None):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply GCN layers
+        if self.skip:
+            x_skip = self.preprocess(x)
+            
+        if self.use_ppr and ppr_matrix is not None:
+            ppr_features = ppr_matrix @ x
+            ppr_features = ppr_features @ self.ppr_weight    
+            
+        # Apply the GCN layers and the activation function
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = self.batch_norms[i](x)
+            if self.skip:                
+                x = x + x_skip
+            
+        
+        # Output layer (no activation applied here)
+        x = self.convs[-1](x, edge_index)
+        x = self.batch_norms[i](x)
+        
+        # Combine with PPR features
+        if self.use_ppr and ppr_matrix is not None:
+            x = x + ppr_features
+            
+        
+        # Global mean pooling to aggregate node embeddings
+        x = global_mean_pool(x, batch)
+        #x = global_max_pool(x, batch)
+
+        # Fully connected layer for graph classification
+        x = self.fc(x)
+        return x
+    
+    def forward_2(self, data, ppr_matrix=None):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply GCN layers
+        if self.skip:
+            x_skip = self.preprocess(x)
+            
+        if self.use_ppr and ppr_matrix is not None:
+            ppr_features = ppr_matrix @ x
+            ppr_features = ppr_features @ self.ppr_weight    
+            
+        # Apply the GCN layers and the activation function
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = self.batch_norms[i](x)
+            if self.skip:                
+                x = x + x_skip
+        
+        # Output layer (no activation applied here)
+        x = self.convs[-1](x, edge_index)
+        x = self.batch_norms[i](x)
+        
+        # Combine with PPR features
+        if self.use_ppr and ppr_matrix is not None:
+            x = x + ppr_features
+
+        # Global mean pooling to aggregate node embeddings
+        x = global_mean_pool(x, batch)
+
+        # Fully connected layer for graph classification
+        x = self.fc(x)
+        return x
+'''
+class GSGPP(torch.nn.Module):
+    def __init__(self, **kwargs):
+        super(GSGPP, self).__init__()
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        activation = kwargs.get("activation", F.relu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        
+        self.num_features = num_features
+        self.num_layers = num_layers
+        self.activation = activation
+        self.dropout = dropout
+        self.skip = skip
+        self.use_ppr = use_ppr
+        # Initialize the first convolutional layer
+        
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(SAGEConv(num_features, hidden_channels))
+
+        # Add intermediate convolutional layers if needed
+        for _ in range(num_layers - 2):
+            self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+
+        # Output layer
+        self.convs.append(SAGEConv(hidden_channels, hidden_channels))
         
         if self.skip:
             # Create a process layer.
@@ -514,15 +689,133 @@ class GCNGPP(torch.nn.Module):
         x = self.fc(x)
         return x
     
+class GATGPP(torch.nn.Module):
+    def __init__(self, **kwargs):
+        super(GATGPP, self).__init__()
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        activation = kwargs.get("activation", F.elu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        
+        self.num_features = num_features
+        self.num_layers = num_layers
+        self.activation = activation
+        self.dropout = dropout
+        self.skip = skip
+        self.use_ppr = use_ppr
+        num_heads = 4
+        # Initialize the first convolutional layer
+        
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(GATConv(num_features, hidden_channels, heads=num_heads))
+
+        # Add intermediate convolutional layers if needed
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_channels * num_heads, hidden_channels, heads=num_heads))
+
+        # Output layer
+        self.convs.append(GATConv(hidden_channels * num_heads, hidden_channels, heads=num_heads, concat=False))
+        
+        if self.skip:
+            # Create a process layer.
+            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
+            
+        if self.use_ppr:
+            self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
+            torch.nn.init.xavier_uniform_(self.ppr_weight)
+        # Define GCN layers
+        
+        # Define a fully connected layer for graph classification
+        self.fc = torch.nn.Linear(hidden_channels, out_channels)
+        
+
+    def forward(self, data, ppr_matrix=None):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply GCN layers
+        if self.skip:
+            x_skip = self.preprocess(x)
+            
+        if self.use_ppr and ppr_matrix is not None:
+            ppr_features = ppr_matrix @ x
+            ppr_features = ppr_features @ self.ppr_weight    
+            
+        # Apply the GCN layers and the activation function
+        for conv in self.convs[:-1]:
+            x = conv(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            if self.skip:                
+                x = x + x_skip
+        
+        # Output layer (no activation applied here)
+        x = self.convs[-1](x, edge_index)
+        
+        # Combine with PPR features
+        if self.use_ppr and ppr_matrix is not None:
+            x = x + ppr_features
+
+        # Global mean pooling to aggregate node embeddings
+        x = global_mean_pool(x, batch)
+
+        # Fully connected layer for graph classification
+        x = self.fc(x)
+        return x
+    
+    def forward_2(self, data, ppr_matrix=None):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Apply GCN layers
+        if self.skip:
+            x_skip = self.preprocess(x)
+            
+        if self.use_ppr and ppr_matrix is not None:
+            ppr_features = ppr_matrix @ x
+            ppr_features = ppr_features @ self.ppr_weight    
+            
+        # Apply the GCN layers and the activation function
+        for conv in self.convs[:-1]:
+            x = conv(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            if self.skip:                
+                x = x + x_skip
+        
+        # Output layer (no activation applied here)
+        x = self.convs[-1](x, edge_index)
+        
+        # Combine with PPR features
+        if self.use_ppr and ppr_matrix is not None:
+            x = x + ppr_features
+
+        # Global mean pooling to aggregate node embeddings
+        x = global_mean_pool(x, batch)
+
+        # Fully connected layer for graph classification
+        x = self.fc(x)
+        return x
     
 
-'''
+
 class GCNGPP(torch.nn.Module):
 
-    def __init__(self, num_features=1, hidden_channels=64, out_channels=8, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
+    def __init__(self, **kwargs):
         super(GCNGPP, self).__init__()
-
-        # Only for easy implementation (variable name change)
+        
+        num_features = kwargs.get("num_features", 1)
+        out_channels = kwargs.get("out_channels", 8)
+        num_layers = kwargs.get("num_layers", 2)
+        hidden_channels = kwargs.get("hidden_channels", 64)
+        activation = kwargs.get("activation", F.relu)
+        dropout = kwargs.get("dropout", 0.0)
+        skip = kwargs.get("skip", False)
+        use_ppr = kwargs.get("use_ppr", False)
+        
         
         num_layer = num_layers
         emb_dim = hidden_channels
@@ -565,10 +858,10 @@ class GCNGPP(torch.nn.Module):
         else:
             raise ValueError("Invalid graph pooling type.")
 
-        if graph_pooling == "set2set":
-            self.graph_pred_linear = torch.nn.Linear(2*self.emb_dim, self.num_class)
-        else:
-            self.graph_pred_linear = torch.nn.Linear(self.emb_dim, self.num_class)
+        #if graph_pooling == "set2set":
+            #self.graph_pred_linear = torch.nn.Linear(2*self.emb_dim, self.num_class)
+        #else:
+        self.graph_pred_linear = torch.nn.Linear(self.emb_dim, self.num_class)
             
             
         self.num_layer = num_layer
@@ -609,7 +902,16 @@ class GCNGPP(torch.nn.Module):
     def forward(self, batched_data):
         x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
 
-
+        # Convert torch x to long
+        #x = x.long()
+        
+        # squeeze the batch dimension
+        #x = x.squeeze()
+        print(x.shape)
+        print(edge_attr.shape)
+        print(edge_index.shape)
+        
+        
         ### computing input node embedding
 
         h_list = [self.node_encoder(x)]
@@ -618,7 +920,7 @@ class GCNGPP(torch.nn.Module):
             x_skip = self.preprocess(self.node_encoder(x))
         
         for layer in range(self.num_layer):
-
+            #print(h_list[layer].shape)
             h = self.convs[layer](h_list[layer], edge_index, edge_attr)
             h = self.batch_norms[layer](h)
 
@@ -650,7 +952,7 @@ class GCNGPP(torch.nn.Module):
 
         return self.graph_pred_linear(h_graph)
 
-'''
+
     
 # FFN for skip connections
 def create_ffn(num_features, hidden_channels, dropout_rate):
