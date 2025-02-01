@@ -14,7 +14,7 @@ import numpy as np
 
 
 class GraphDataset:
-    def __init__(self, dataname='cora', raw_data_path=None, batch_size=32, shuffle=True, noise_level=0.0, test_size=0.2, val_size=0.1, random_state=42):
+    def __init__(self, dataname='cora', raw_data_path=None, batch_size=32, shuffle=True, noise_level=0.0, test_size=0.2, val_size=0.1, random_state=42, num_train_per_class=20):
         """
         Initialize the GraphDataset class.
         :param data: Optional initial dataset (e.g., a dictionary of adjacency lists)
@@ -27,6 +27,7 @@ class GraphDataset:
         self.test_size = test_size
         self.val_size = val_size
         self.random_state = random_state
+        self.num_train_per_class = num_train_per_class
 
     def get_dataset(self):
         """
@@ -192,8 +193,18 @@ class GraphDataset:
         train_mask = torch.zeros(num_nodes, dtype=torch.bool)
         val_mask = torch.zeros(num_nodes, dtype=torch.bool)
         test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        
+        # get number of unique classes
+        num_classes = len(set(data.y.numpy()))
+        
+        # Get num_train_per_class for train mask
+        for i in range(num_classes):
+            idx = (data.y == i).nonzero().view(-1)
+            idx = idx[torch.randperm(idx.size(0))]
+            train_mask[idx[:self.num_train_per_class]] = True
 
-        train_mask[train_idx] = True
+
+        #train_mask[train_idx] = True
         val_mask[val_idx] = True
         test_mask[test_idx] = True
 

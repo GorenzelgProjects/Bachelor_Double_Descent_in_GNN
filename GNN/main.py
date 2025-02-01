@@ -56,7 +56,8 @@ if __name__ == '__main__':
                       noise_level=hyperparams.get("noise_level", 0.0),
                       test_size=hyperparams.get("test_size", 0.2),
                       val_size=hyperparams.get("val_size", 0.2),
-                      random_state=hyperparams.get("random_seed", 42))
+                      random_state=hyperparams.get("random_seed", 42),
+                      num_train_per_class = hyperparams.get("num_train_per_class", 20),)
     
     # Initialize the oversmooth measure
     osm = OversmoothMeasure()
@@ -73,6 +74,8 @@ if __name__ == '__main__':
     
     print(f"Dataset Info:\n{data}")
     
+    # get how many false in train_mask
+    print(f"Train mask: {data.train_mask.sum()}")
     
     model_name = hyperparams.get("model_type", "GCN")
     
