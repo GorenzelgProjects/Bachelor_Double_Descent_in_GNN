@@ -93,7 +93,7 @@ class GraphDataset:
         return data
         
     def get_cora(self):
-        dataset = Planetoid(root='/tmp/Cora', name='Cora')
+        dataset = Planetoid(root='/tmp/Cora', name='Cora', num_train_per_class=self.num_train_per_class)
         loader = self.load_dataset(dataset=dataset)
         
         edge_index = loader.dataset[0].edge_index
@@ -135,7 +135,7 @@ class GraphDataset:
     
 
     def get_citeseer(self):
-        dataset = Planetoid(root='/tmp/CiteSeer', name='CiteSeer')
+        dataset = Planetoid(root='/tmp/CiteSeer', name='CiteSeer', num_train_per_class=self.num_train_per_class)
         loader = self.load_dataset(dataset=dataset)
         
         edge_index = loader.dataset[0].edge_index
