@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import os
 import csv
+import pandas as pd
 
 class Trainer:
     def __init__(self, 
@@ -20,6 +21,7 @@ class Trainer:
                     gpp,
                     skip,
                     ppr,
+                    trial_num=1,  # Add trial number parameter
                     **kwargs):
         
         
@@ -30,6 +32,7 @@ class Trainer:
         self.device = device
         self.output_path = output_path
         self.evaluator=evaluator
+        self.trial_num = trial_num  # Store trial number
         
         self.gpp = gpp
         self.skip = skip
@@ -51,16 +54,270 @@ class Trainer:
         self.dprate = hyperparams.get("dropout", 0.5)
         self.save_interval = hyperparams.get("save_interval", 10)
 
+        # Progressive width specific parameters
+        self.progressive_width = hyperparams.get("progressive_width", True)  # Enable/disable progressive width
+        self.base_lr_scaling = hyperparams.get("base_lr_scaling", True)     # Scale learning rate with model size
+        self.gradient_clipping = hyperparams.get("gradient_clipping", 1.0)   # Clip gradients for stability
+        self.warmup_epochs_ratio = hyperparams.get("warmup_epochs_ratio", 0.1)  # Fraction of epochs for warmup
+        
+        # Adjust learning rate ranges for progressive width models
+        if self.progressive_width:
+            # Progressive width models may need different learning rates
+            self.learning_rate_range = hyperparams.get("learning_rate_range", {
+                "min": 0.001, "max": 0.01, "values": [0.001, 0.005, 0.01]
+            })
+
         # Store the arguments needed for model initialization
         self.model_kwargs = kwargs
         
         self.measure = OversmoothMeasure()    
         
+        # Create trial-specific checkpoint directory
+        self.checkpoint_dir = os.path.dirname(self.output_path)
+        self.checkpoint_base = os.path.join(self.checkpoint_dir, "checkpoints")
+        os.makedirs(self.checkpoint_base, exist_ok=True)
+        
+        print(f"Trainer initialized for trial {self.trial_num}")
+        print(f"Progressive width enabled: {self.progressive_width}")
+        if self.progressive_width:
+            print(f"  - Base K range: {self.hidden_channels_range}")
+            print(f"  - Layer range: {self.layer_range}")
+            print(f"  - Adaptive learning rate: {self.base_lr_scaling}")
+            print(f"  - Gradient clipping: {self.gradient_clipping}")
+        print(f"Output path: {self.output_path}")
+        print(f"Checkpoint directory: {self.checkpoint_base}")
+        
+    def calculate_model_complexity(self, num_layers, hidden_channels):
+        """
+        Calculate approximate model complexity for progressive width models.
+        This helps in adjusting learning rates and other hyperparameters.
+        """
+        if not self.progressive_width:
+            # Standard model: all layers have same width
+            total_params = 0
+            for i in range(num_layers):
+                if i == 0:
+                    layer_params = self.num_features * hidden_channels
+                elif i == num_layers - 1:
+                    layer_params = hidden_channels * self.out_channels
+                else:
+                    layer_params = hidden_channels * hidden_channels
+                total_params += layer_params
+        else:
+            # Progressive width: K, 2K, 3K, ..., nK - FIXED
+            total_params = 0
+            for i in range(num_layers):
+                if i == 0:
+                    # First layer: input_features -> K
+                    layer_params = self.num_features * hidden_channels
+                elif i == num_layers - 1:
+                    # Last layer: K*i -> output_channels
+                    layer_params = hidden_channels * i * self.out_channels
+                else:
+                    # Intermediate layers: K*i -> K*(i+1)
+                    layer_params = hidden_channels * i * hidden_channels * (i + 1)
+                
+                total_params += layer_params
+        
+        return total_params
+    
+    def get_adaptive_learning_rate(self, num_layers, hidden_channels):
+        """
+        Calculate adaptive learning rate based on model complexity.
+        Larger models (more parameters) typically need smaller learning rates.
+        """
+        if not self.base_lr_scaling or not self.progressive_width:
+            return self.learning_rate
+        
+        base_lr = self.learning_rate
+        model_complexity = self.calculate_model_complexity(num_layers, hidden_channels)
+        
+        # Calculate baseline complexity (2-layer standard model)
+        baseline_complexity = self.num_features * hidden_channels + hidden_channels * self.out_channels
+        
+        # Scale learning rate inversely with relative model complexity
+        complexity_ratio = model_complexity / baseline_complexity
+        scaling_factor = 1.0 / np.sqrt(complexity_ratio)
+        
+        adaptive_lr = base_lr * scaling_factor
+        
+        # Clamp learning rate to reasonable bounds
+        adaptive_lr = np.clip(adaptive_lr, 0.0001, 0.1)
+        
+        print(f"Model complexity: {model_complexity:,} params (baseline: {baseline_complexity:,}), "
+              f"Base LR: {base_lr:.4f}, Adaptive LR: {adaptive_lr:.4f}")
+        
+        return adaptive_lr
+    
+    def setup_progressive_width_model(self, num_layers, hidden_channels):
+        """
+        Setup model with progressive width specific configurations.
+        """
+        # Calculate adaptive learning rate
+        adaptive_lr = self.get_adaptive_learning_rate(num_layers, hidden_channels)
+        
+        # Update model kwargs with adaptive learning rate
+        self.model_kwargs['learning_rate'] = adaptive_lr
+        
+        # Add progressive width specific parameters
+        self.model_kwargs['progressive_width'] = self.progressive_width
+        
+        print(f"Trial {self.trial_num}: Progressive width model setup - "
+              f"L{num_layers}, base_K={hidden_channels}, adaptive_lr={adaptive_lr:.4f}")
+        
+        return adaptive_lr
+        
+    def get_checkpoint_path(self, num_layers, hidden_channels):
+        """Generate trial-specific checkpoint path for a specific configuration"""
+        return os.path.join(self.checkpoint_base, 
+                           f"{self.model_name}_L{num_layers}_H{hidden_channels}_trial{self.trial_num}.pth")
+    
+    def save_checkpoint(self, model, optimizer, epoch, num_layers, hidden_channels, 
+                       train_loss, best_train_loss):
+        """Save model checkpoint with trial-specific naming"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_loss,
+            'best_train_loss': best_train_loss,
+            'num_layers': num_layers,
+            'hidden_channels': hidden_channels,
+            'trial_num': self.trial_num,
+            'model_kwargs': self.model_kwargs,
+            'progressive_width': self.progressive_width
+        }
+        
+        checkpoint_path = self.get_checkpoint_path(num_layers, hidden_channels)
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved at {checkpoint_path}")
+    
+    def load_checkpoint(self, num_layers, hidden_channels):
+        """Load trial-specific model checkpoint if it exists"""
+        checkpoint_path = self.get_checkpoint_path(num_layers, hidden_channels)
+        
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            return checkpoint
+        return None
+    
+    def clean_incomplete_training_logs(self):
+        """
+        Clean the log file by removing incomplete training entries.
+        Only keeps entries where the configuration reached the target number of epochs.
+        """
+        if not os.path.exists(self.output_path):
+            print(f"No existing log file found at {self.output_path}")
+            return
+        
+        try:
+            df = pd.read_csv(self.output_path)
+            if df.empty:
+                return
+            
+            max_epochs = self.epoch_range['max']
+            original_length = len(df)
+            
+            # Group by configuration and find which ones are incomplete
+            grouped = df.groupby(['layers', 'hidden_channels'])
+            configurations_to_keep = []
+            
+            for (layers, hidden_channels), group in grouped:
+                max_epoch_completed = group['epochs'].max()
+                
+                if max_epoch_completed >= max_epochs:
+                    # Keep all entries for this complete configuration
+                    configurations_to_keep.append((layers, hidden_channels))
+                    print(f"Trial {self.trial_num}: Configuration L{layers}_H{hidden_channels} is complete ({max_epoch_completed} epochs) - keeping entries")
+                else:
+                    # Remove all entries for this incomplete configuration
+                    print(f"Trial {self.trial_num}: Configuration L{layers}_H{hidden_channels} is incomplete ({max_epoch_completed} epochs) - removing entries")
+                    # Also remove corresponding checkpoint
+                    checkpoint_path = self.get_checkpoint_path(layers, hidden_channels)
+                    if os.path.exists(checkpoint_path):
+                        os.remove(checkpoint_path)
+                        print(f"Removed incomplete checkpoint: {checkpoint_path}")
+            
+            # Filter dataframe to keep only complete configurations
+            if configurations_to_keep:
+                mask = df.apply(lambda row: (row['layers'], row['hidden_channels']) in configurations_to_keep, axis=1)
+                cleaned_df = df[mask]
+            else:
+                # No complete configurations, create empty dataframe with same columns
+                cleaned_df = df.iloc[0:0].copy()
+            
+            # Write cleaned dataframe back to file
+            cleaned_df.to_csv(self.output_path, index=False)
+            
+            removed_entries = original_length - len(cleaned_df)
+            if removed_entries > 0:
+                print(f"Trial {self.trial_num}: Cleaned log file: removed {removed_entries} incomplete entries, kept {len(cleaned_df)} complete entries")
+            else:
+                print(f"Trial {self.trial_num}: Log file is already clean: all {len(cleaned_df)} entries represent complete training runs")
+                
+        except Exception as e:
+            print(f"Error cleaning log file {self.output_path}: {e}")
+
+    def get_training_progress(self):
+        """
+        Check existing training progress from CSV log file.
+        Returns dict with completed configurations and their progress.
+        """
+        if not os.path.exists(self.output_path):
+            print(f"Trial {self.trial_num}: No existing log file found at {self.output_path}")
+            return {}
+        
+        try:
+            df = pd.read_csv(self.output_path)
+            if df.empty:
+                return {}
+            
+            progress = {}
+            max_epochs = self.epoch_range['max']
+            
+            # Group by configuration (layers, hidden_channels)
+            grouped = df.groupby(['layers', 'hidden_channels'])
+            
+            for (layers, hidden_channels), group in grouped:
+                max_epoch_completed = group['epochs'].max()
+                progress[(layers, hidden_channels)] = {
+                    'max_epoch_completed': max_epoch_completed,
+                    'is_complete': max_epoch_completed >= max_epochs,
+                    'last_train_loss': group.loc[group['epochs'].idxmax(), 'train_loss']
+                }
+            
+            return progress
+            
+        except Exception as e:
+            print(f"Error reading progress from {self.output_path}: {e}")
+            return {}
+    
+    def should_skip_configuration(self, num_layers, hidden_channels, progress):
+        """
+        Determine if a configuration should be skipped based on existing progress
+        """
+        config_key = (num_layers, hidden_channels)
+        
+        if config_key in progress:
+            config_progress = progress[config_key]
+            if config_progress['is_complete']:
+                print(f"Trial {self.trial_num}: Configuration L{num_layers}_H{hidden_channels} already completed "
+                      f"({config_progress['max_epoch_completed']} epochs). Skipping.")
+                return True
+        
+        return False
+        
         
     def hyperparameter_train(self):
         """
-        Perform hyperparameter search by iterating only over the parameters where min and max values are different.
+        Enhanced hyperparameter search with progressive width considerations
         """
+        # First, clean any incomplete training logs
+        self.clean_incomplete_training_logs()
+        
+        # Check existing progress after cleaning
+        progress = self.get_training_progress()
+        
         # Determine whether the ranges are different
         vary_layers = self.layer_range['min'] != self.layer_range['max']
         vary_hidden_channels = self.hidden_channels_range['min'] != self.hidden_channels_range['max']
@@ -70,11 +327,6 @@ class Trainer:
         num_layers_fixed = self.layer_range['min']
         hidden_channels_fixed = self.hidden_channels_range['min']
         epochs_fixed = self.epoch_range['min']
-
-        # Loop over activation functions
-
-        #activation_fn = 0
-
 
         # Loop over num_layers only if the range is variable
         if vary_layers:
@@ -96,24 +348,42 @@ class Trainer:
         else:
             epochs_values = [epochs_fixed]
 
+        # Enhanced logging for progressive width
+        if self.progressive_width:
+            print(f"Trial {self.trial_num}: Training with PROGRESSIVE WIDTH enabled")
+            print(f"  - Base K range: {self.hidden_channels_range}")
+            print(f"  - Layer range: {self.layer_range}")
+            print(f"  - Adaptive learning rate: {self.base_lr_scaling}")
+            print(f"  - Gradient clipping: {self.gradient_clipping}")
+
         # Perform the hyperparameter search
         for num_layers in num_layers_values:
             for hidden_channels in hidden_channels_values:
                 for epochs in epochs_values:
-                    print(f"Training with {num_layers} layers, {hidden_channels} hidden channels, {epochs} epochs, "
+                    
+                    # Check if this configuration should be skipped (already completed)
+                    if self.should_skip_configuration(num_layers, hidden_channels, progress):
+                        continue
+                    
+                    # Calculate expected model complexity for progressive width
+                    if self.progressive_width:
+                        model_complexity = self.calculate_model_complexity(num_layers, hidden_channels)
+                        print(f"Trial {self.trial_num}: Training progressive width model - "
+                              f"L{num_layers}, base_K={hidden_channels}, ~{model_complexity:,} params")
+                    
+                    print(f"Trial {self.trial_num}: Training with {num_layers} layers, {hidden_channels} hidden channels, {epochs} epochs, "
                             f"{self.activation_name} activation, learning rate {self.learning_rate}")
                     
                     # Update model kwargs
-                    
                     self.model_kwargs['model_name'] = self.model_name
                     self.model_kwargs['num_layers'] = num_layers
                     self.model_kwargs['num_features'] = self.num_features
                     self.model_kwargs['out_channels'] = self.out_channels
-                    self.model_kwargs['hidden_channels'] = hidden_channels
+                    self.model_kwargs['hidden_channels'] = hidden_channels  # This is now base K for progressive width
                     self.model_kwargs['activation_name'] = self.activation_name
                     self.model_kwargs['loss_name'] = self.loss_name
                     self.model_kwargs['optimizer_name'] = self.optimizer_name
-                    self.model_kwargs['learning_rate'] = self.learning_rate
+                    self.model_kwargs['learning_rate'] = self.learning_rate  # Will be adjusted in train()
                     self.model_kwargs['skip'] = self.skip
                     self.model_kwargs['device'] = self.device
                     self.model_kwargs['ppr'] = self.ppr
@@ -132,6 +402,7 @@ class Trainer:
                         self.model_kwargs['alpha'] = self.alpha
                         self.model_kwargs['dprate'] = self.dprate
                     
+                    # Create initial model wrapper (will be recreated in train() with adaptive LR if needed)
                     self.mw = ModelWrapper(self.data, **self.model_kwargs)
                     
 
@@ -148,16 +419,15 @@ class Trainer:
                                                          epochs=epochs, 
                                                          num_layers=num_layers, 
                                                          hidden_channels=hidden_channels)
-                    '''
-                        best_train_loss = self.train_gpp(data, 
-                                                    optimizer_name=optimizer, 
-                                                    loss_name=loss, 
-                                                    epochs=epochs, 
-                                                    learning_rate=learning_rate, 
-                                                    num_layers=num_layers, 
-                                                    hidden_channels=hidden_channels)
-                    '''
+
     def train(self, num_layers, hidden_channels, epochs):
+        
+        # Setup progressive width specific configurations
+        if self.progressive_width:
+            adaptive_lr = self.setup_progressive_width_model(num_layers, hidden_channels)
+            
+            # Recreate model wrapper with updated learning rate
+            self.mw = ModelWrapper(self.data, **self.model_kwargs)
         
         # Get the optimizer and loss function based on names
         optimizer = self.mw.optimizer
@@ -171,13 +441,37 @@ class Trainer:
 
         # Track the best train loss
         best_train_loss = float('inf')
+        
+        # Progressive width models may need warmup
+        warmup_epochs = int(epochs * self.warmup_epochs_ratio) if self.progressive_width else 0
+        warmup_epochs = max(1, min(warmup_epochs, 20))  # At least 1, at most 20 epochs
 
         # Training loop
         for epoch in range(epochs):
+            
+            # Learning rate warmup for progressive width models
+            if self.progressive_width and epoch < warmup_epochs:
+                if hasattr(self, 'adaptive_lr'):
+                    warmup_lr = self.model_kwargs['learning_rate'] * (epoch + 1) / warmup_epochs
+                else:
+                    warmup_lr = self.learning_rate * (epoch + 1) / warmup_epochs
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = warmup_lr
+            elif self.progressive_width and epoch == warmup_epochs:
+                # Reset to full learning rate after warmup
+                full_lr = self.model_kwargs.get('learning_rate', self.learning_rate)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = full_lr
+                    
             optimizer.zero_grad()
             out = self.mw.model(self.data.x.to(self.device), self.data.edge_index.to(self.device), ppr_matrix=self.mw.ppr_matrix)
             train_loss = loss_fn(out[self.data.train_mask.to(self.device)], self.data.y[self.data.train_mask].to(self.device))
             train_loss.backward()
+            
+            # Gradient clipping for stability (especially important for progressive width)
+            if self.progressive_width and self.gradient_clipping > 0:
+                torch.nn.utils.clip_grad_norm_(self.mw.model.parameters(), self.gradient_clipping)
+            
             optimizer.step()
             
             # train loss as a float
@@ -193,7 +487,6 @@ class Trainer:
             if (epoch+1) % self.save_interval == 0 or epoch+1 < 10:
                 # Get hidden representations
                 hidden_representations = self.get_hidden_representations()
-                #self.model.train()
                 
                 with torch.no_grad():
                 # make the labels one-hot
@@ -215,19 +508,35 @@ class Trainer:
                 # Calculate the MadGap
                 madgap_value = round(float(mad_rmt - mad_value), 4)
                 
-                
                 # Calculate the Dirichlet Energy
                 dirichlet_energy = self.measure.get_dirichlet_energy(hidden_representations, self.adj_matrix)
                 dirichlet_energy = round(float(dirichlet_energy), 4)
+                
+                # Get current learning rate for logging
+                current_lr = optimizer.param_groups[0]['lr']
+                
+                # Calculate actual model complexity for logging
+                model_complexity = self.calculate_model_complexity(num_layers, hidden_channels)
                 
                 # Save the results to a CSV file
                 results = [
                     {"model_type": model_type, "layers": num_layers, "hidden_channels": hidden_channels, "epochs": epoch+1,
                         "train_loss": train_loss_cpu, "train_mse_loss": train_mse_loss, "train_accuracy": train_accuracy, 
                         "test_loss": test_loss, "test_mse_loss": test_mse_loss, "test_accuracy": test_accuracy, 
-                        "mad_value": mad_value, "mad_gap": madgap_value, "dirichlet_energy": dirichlet_energy},
+                        "mad_value": mad_value, "mad_gap": madgap_value, "dirichlet_energy": dirichlet_energy, 
+                        "trial": self.trial_num, "learning_rate": current_lr, "progressive_width": self.progressive_width,
+                        "model_complexity": model_complexity},  # Add additional info
                 ]
                 self.save_training_results(results)
+                
+                # Save checkpoint periodically
+                if (epoch + 1) % (self.save_interval * 5) == 0:  # Save checkpoint every 50 epochs
+                    self.save_checkpoint(self.mw.model, optimizer, epoch + 1, num_layers, 
+                                       hidden_channels, train_loss_cpu, best_train_loss)
+        
+        # Save final checkpoint
+        self.save_checkpoint(self.mw.model, optimizer, epochs, num_layers, 
+                           hidden_channels, train_loss_cpu, best_train_loss)
                 
         return best_train_loss
     
@@ -253,6 +562,13 @@ class Trainer:
     # Train the model for Graph Property Prediction
     def train_gpp(self, data, epochs=100, num_layers=2, hidden_channels=16):
         
+        # Setup progressive width specific configurations for GPP
+        if self.progressive_width:
+            adaptive_lr = self.setup_progressive_width_model(num_layers, hidden_channels)
+            
+            # Recreate model wrapper with updated learning rate
+            self.mw = ModelWrapper(data, **self.model_kwargs)
+        
         # Get the optimizer and loss function based on names
         optimizer = self.mw.optimizer
         loss_fn = self.mw.loss
@@ -265,23 +581,30 @@ class Trainer:
         
         train_loader, valid_loader, test_loader = data
         
+        # Progressive width models may need warmup
+        warmup_epochs = int(epochs * self.warmup_epochs_ratio) if self.progressive_width else 0
+        warmup_epochs = max(1, min(warmup_epochs, 20))
+        
         # Training loop
         for epoch in range(epochs):
-            #print('Epoch:', epoch)
+            
+            # Learning rate warmup for progressive width models
+            if self.progressive_width and epoch < warmup_epochs:
+                if hasattr(self, 'adaptive_lr'):
+                    warmup_lr = self.model_kwargs['learning_rate'] * (epoch + 1) / warmup_epochs
+                else:
+                    warmup_lr = self.learning_rate * (epoch + 1) / warmup_epochs
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = warmup_lr
+            elif self.progressive_width and epoch == warmup_epochs:
+                # Reset to full learning rate after warmup
+                full_lr = self.model_kwargs.get('learning_rate', self.learning_rate)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = full_lr
+            
             running_loss = 0.0
             running_mse_loss = 0.0
             for batch in train_loader:
-                
-                '''# Use batch.edge_index to create the adjacency matrix
-                adj_matrix = torch.zeros((batch.num_nodes, batch.num_nodes))
-                for i in range(batch.edge_index.shape[1]):
-                    adj_matrix[batch.edge_index[0, i], batch.edge_index[1, i]] = 1
-                    adj_matrix[batch.edge_index[1, i], batch.edge_index[0, i]] = 1
-                    
-                rmt_adj_matrix = torch.ones((batch.num_nodes, batch.num_nodes)) - adj_matrix
-                '''
-                #batch = batch.to(torch.long())
-                # convert batch to long
                 
                 batch = batch.to(self.device)
 
@@ -294,6 +617,11 @@ class Trainer:
                     loss = loss_fn(out, batch.y)
                     
                     loss.backward()
+                    
+                    # Gradient clipping for progressive width models
+                    if self.progressive_width and self.gradient_clipping > 0:
+                        torch.nn.utils.clip_grad_norm_(self.mw.model.parameters(), self.gradient_clipping)
+                    
                     optimizer.step()
                     
                     running_loss += loss.item()
@@ -315,14 +643,29 @@ class Trainer:
                 train_accuracy, _, _ = self.eval(train_loader, loss_fn)
                 
                 test_accuracy, test_loss, test_loss_mse = self.eval(test_loader, loss_fn, test=True)
+                
+                # Get current learning rate and model complexity for logging
+                current_lr = optimizer.param_groups[0]['lr']
+                model_complexity = self.calculate_model_complexity(num_layers, hidden_channels)
                     
                 results = [
                     {"model_type": model_type, "layers": num_layers, "hidden_channels": hidden_channels, "epochs": epoch+1,
                         "train_loss": round(float(loss), 6), "train_mse_loss": round(float(loss_mse), 6), "train_accuracy": round(float(train_accuracy), 6), 
                         "test_loss": round(float(test_loss), 6), "test_mse_loss": round(float(test_loss_mse), 6), "test_accuracy": round(float(test_accuracy), 6), 
-                        "mad_value": 0, "mad_gap": 0, "dirichlet_energy": 0},
+                        "mad_value": 0, "mad_gap": 0, "dirichlet_energy": 0, "trial": self.trial_num,
+                        "learning_rate": current_lr, "progressive_width": self.progressive_width,
+                        "model_complexity": model_complexity},  # Add additional info
                 ]
                 self.save_training_results(results)
+                
+                # Save checkpoint periodically
+                if (epoch + 1) % (self.save_interval * 5) == 0:
+                    self.save_checkpoint(self.mw.model, optimizer, epoch + 1, num_layers, 
+                                       hidden_channels, loss, 0)
+        
+        # Save final checkpoint
+        self.save_checkpoint(self.mw.model, optimizer, epochs, num_layers, 
+                           hidden_channels, loss, 0)
             
         print('Training done')
         return None
@@ -381,7 +724,6 @@ class Trainer:
     def get_hidden_representations(self):
         self.mw.model.eval()
         with torch.no_grad():
-            #hidden_representations = model(data).detach().cpu().numpy()
             try:
                 hidden_representations = self.mw.model.forward_2(self.data.x.to(self.device), self.data.edge_index.to(self.device), self.mw.ppr_matrix).detach().cpu().numpy()
                 
@@ -391,13 +733,17 @@ class Trainer:
         return hidden_representations
     
     def save_training_results(self, results):
+        """
+        Enhanced result saving with progressive width information
+        """
         file_exists = os.path.isfile(self.output_path)
         
         with open(self.output_path, 'a', newline='') as csvfile:
             fieldnames = ['model_type', 'layers', "hidden_channels", "epochs", 
                         'train_loss', 'train_mse_loss', 'train_accuracy', 
                         'test_loss', 'test_mse_loss', 'test_accuracy', 
-                        'mad_value', 'mad_gap', 'dirichlet_energy']
+                        'mad_value', 'mad_gap', 'dirichlet_energy', 'trial',
+                        'learning_rate', 'progressive_width', 'model_complexity']  # Add new fields
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
             if not file_exists:

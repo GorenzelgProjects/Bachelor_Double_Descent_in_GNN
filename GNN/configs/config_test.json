@@ -1,8 +1,8 @@
 {
     "model_type": "GCN",
     "layer_range": {
-        "min": 2,
-        "max": 2,
+        "min": 1,
+        "max": 8,
         "step": 1
     },
     "hidden_channels_range": {
@@ -19,7 +19,7 @@
     "dropout": 0.0,
     "num_heads": 2,
     "label_noise": 0.15,
-    "save_interval": 10,
+    "save_interval": 50,
     "learning_rate": 0.01,
     "batch_size": 32,
     "data_shuffle": "True",
@@ -28,14 +28,14 @@
     "random_seed": 42,
     "optimizer": "adam",
     "loss": "cross_entropy",
-    "output_path": "test_training_log_1.csv",
+    "output_path": "cora_gcn_skip_1_",
     "ppnp": "PPNP",
     "K": 32,
     "alpha": 0.85,
     "dprate": 0.0,
-    "skip": "False",
+    "skip": "True",
     "ppr": "False",
     "raw_data_path": "None",
     "num_train_per_class":20,
-    "dataset": "airports"
+    "dataset": "cora"
 }

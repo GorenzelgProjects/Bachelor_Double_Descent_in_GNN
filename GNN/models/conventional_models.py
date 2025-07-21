@@ -16,18 +16,8 @@ import math
 
 class GCN(torch.nn.Module):
     """
-        Graph Convolutional Network (GCN) model.
-
-        Parameters:
-            num_features (int): Number of input features.
-            hidden_channels (int): Number of hidden channels.
-            out_channels (int): Number of output channels.
-            num_layers (int, optional): Number of GCN layers. Default is 2.
-            activation (callable, optional): Activation function. Default is F.relu.
-            dropout (float, optional): Dropout rate. Default is 0.0.
-
-        Returns:
-            torch.Tensor: Output tensor after passing through the GCN layers.
+        Graph Convolutional Network (GCN) model with progressive width and ResGCN-style skip connections.
+        Now supports: hidden_channels = K, layer i has K*i channels (except last layer).
     """
     
     def __init__(self, **kwargs):
@@ -40,21 +30,56 @@ class GCN(torch.nn.Module):
         self.dropout = kwargs.get("dropout", 0.0)
         self.skip = kwargs.get("skip", False)
         self.use_ppr = kwargs.get("use_ppr", False)
-        hidden_channels = kwargs.get("hidden_channels", 64)
-        # Initialize the first convolutional layer
+        hidden_channels = kwargs.get("hidden_channels", 64)  # This is now the base K
+        
+        # Calculate progressive layer dimensions - FIXED for single layer case
+        self.layer_dims = []
+        for i in range(num_layers):
+            if i == 0:
+                in_dim = num_features
+                if num_layers == 1:
+                    # Single layer case: input directly to output
+                    out_dim = out_channels
+                else:
+                    # Multi-layer case: first layer outputs K
+                    out_dim = hidden_channels  # K (first layer)
+            elif i == num_layers - 1:
+                # Last layer: previous layer width -> output classes
+                in_dim = hidden_channels * i  # K*i from previous layer
+                out_dim = out_channels
+            else:
+                in_dim = hidden_channels * i  # K*i
+                out_dim = hidden_channels * (i + 1)  # K*(i+1)
+            self.layer_dims.append((in_dim, out_dim))
+            
+        # Debug print layer dimensions
+        print(f"Progressive width GCN layer dimensions:")
+        for i, (in_dim, out_dim) in enumerate(self.layer_dims):
+            print(f"  Layer {i+1}: {in_dim} -> {out_dim}")
+        print(f"Expected output classes: {out_channels}")
+        
+        # Initialize the convolutional layers with progressive widths
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GCNConv(num_features, hidden_channels))
-
-        # Add intermediate convolutional layers if needed
-        for _ in range(num_layers - 2):
-            self.convs.append(GCNConv(hidden_channels, hidden_channels))
-
-        # Output layer
-        self.convs.append(GCNConv(hidden_channels, out_channels))
+        for in_dim, out_dim in self.layer_dims:
+            self.convs.append(GCNConv(in_dim, out_dim))
         
         if self.skip:
-            # Create a process layer.
-            self.preprocess = create_ffn(num_features, hidden_channels, self.dropout)
+            # Create projection layers for ResGCN-style skip connections
+            self.preprocess = torch.nn.ModuleList()
+            for i, (in_dim, out_dim) in enumerate(self.layer_dims):
+                if i == 0:
+                    # First layer: project input to match first layer output
+                    proj_in = num_features
+                    proj_out = out_dim
+                else:
+                    # Other layers: project previous layer output to current layer output
+                    proj_in = self.layer_dims[i-1][1]  # Previous layer's output dim
+                    proj_out = out_dim                 # Current layer's output dim
+                
+                if proj_in == proj_out:
+                    self.preprocess.append(torch.nn.Identity())
+                else:
+                    self.preprocess.append(create_ffn(proj_in, proj_out, self.dropout))
             
         if self.use_ppr:
             self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
@@ -62,74 +87,93 @@ class GCN(torch.nn.Module):
     
 
     def forward(self, x, edge_index, ppr_matrix=None):
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
         if self.use_ppr and ppr_matrix is not None:
             ppr_features = ppr_matrix @ x
             ppr_features = ppr_features @ self.ppr_weight    
             
-        # Apply the GCN layers and the activation function
-        for conv in self.convs[:-1]:
-            x = conv(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Store previous layer output for ResGCN-style skip connections
+        prev_layer = x
+        
+        # Apply the GCN layers with progressive width and skip connections
+        for i, conv in enumerate(self.convs):
+            # Apply convolution
+            h = conv(prev_layer, edge_index)
+            
+            # Apply ResGCN-style skip connection with projection
             if self.skip:
-                # print 10 samples of x
-                #print(x[:10])
-                #print(x_skip[:10])
+                if i == 0:
+                    # First layer: project input to match layer output
+                    skip_connection = self.preprocess[i](x)
+                else:
+                    # Other layers: project previous layer to match current layer output
+                    skip_connection = self.preprocess[i](prev_layer)
                 
-                x = x + x_skip
+                h = h + skip_connection
+            
+            # Apply activation and dropout (except for last layer)
+            if i < len(self.convs) - 1:
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            
+            # Update previous layer for next iteration
+            prev_layer = h
         
-        # Output layer (no activation applied here)
-        x = self.convs[-1](x, edge_index)
-        
-        # Combine with PPR features
+        # Combine with PPR features (project to match final output if needed)
         if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
+            if h.size(1) != ppr_features.size(1):
+                # Create temporary projection for PPR features
+                ppr_proj = torch.nn.Linear(ppr_features.size(1), h.size(1)).to(h.device)
+                ppr_features = ppr_proj(ppr_features)
+            h = h + ppr_features
         
-        return F.log_softmax(x, dim=1)
+        return F.log_softmax(h, dim=1)
     
     def forward_2(self, x, edge_index, ppr_matrix=None):
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
         if self.use_ppr and ppr_matrix is not None:
             ppr_features = ppr_matrix @ x
             ppr_features = ppr_features @ self.ppr_weight
-        # Apply the GCN layers and the activation function
-        for conv in self.convs[:-1]:
-            x = conv(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            if self.skip:
-                x = x + x_skip
-        
-        # Output layer (no activation applied here)
-        x = self.convs[-1](x, edge_index)
-        
-        # Combine with PPR features
-        if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
             
-        return x
+        # Store previous layer output for ResGCN-style skip connections
+        prev_layer = x
+        
+        # Apply the GCN layers with progressive width and skip connections
+        for i, conv in enumerate(self.convs):
+            # Apply convolution
+            h = conv(prev_layer, edge_index)
+            
+            # Apply ResGCN-style skip connection with projection
+            if self.skip:
+                if i == 0:
+                    # First layer: project input to match layer output
+                    skip_connection = self.preprocess[i](x)
+                else:
+                    # Other layers: project previous layer to match current layer output
+                    skip_connection = self.preprocess[i](prev_layer)
+                
+                h = h + skip_connection
+            
+            # Apply activation and dropout (except for last layer)
+            if i < len(self.convs) - 1:
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            
+            # Update previous layer for next iteration
+            prev_layer = h
+        
+        # Combine with PPR features (project to match final output if needed)
+        if self.use_ppr and ppr_matrix is not None:
+            if h.size(1) != ppr_features.size(1):
+                # Create temporary projection for PPR features
+                ppr_proj = torch.nn.Linear(ppr_features.size(1), h.size(1)).to(h.device)
+                ppr_features = ppr_proj(ppr_features)
+            h = h + ppr_features
+            
+        return h
 
 
 class GAT(torch.nn.Module):
     """
-        Graph Attention Network (GAT) model.
-
-        Parameters:
-            num_features (int): Number of input features.
-            hidden_channels (int): Number of hidden channels.
-            out_channels (int): Number of output channels.
-            num_heads (int, optional): Number of attention heads. Default is 1.
-            num_layers (int, optional): Number of GAT layers. Default is 2.
-            activation (callable, optional): Activation function. Default is F.elu.
-            dropout (float, optional): Dropout rate. Default is 0.0.
-
-        Returns:
-            torch.Tensor: Output tensor after passing through the GAT layers.
+        Graph Attention Network (GAT) model with progressive width and ResGCN-style skip connections.
     """
 
     def __init__(self, **kwargs):
@@ -142,7 +186,7 @@ class GAT(torch.nn.Module):
         dropout = kwargs.get("dropout", 0.0)
         skip = kwargs.get("skip", False)
         use_ppr = kwargs.get("use_ppr", False)
-        hidden_channels = kwargs.get("hidden_channels", 64)
+        hidden_channels = kwargs.get("hidden_channels", 64)  # Base K
         num_heads = kwargs.get("num_heads", 1)
         
         self.num_features = num_features
@@ -152,80 +196,151 @@ class GAT(torch.nn.Module):
         self.skip = skip
         self.use_ppr = use_ppr
         
+        # Calculate progressive layer dimensions (accounting for multi-head attention) - FIXED for single layer
+        self.layer_dims = []
+        for i in range(num_layers):
+            if i == 0:
+                in_dim = num_features
+                if num_layers == 1:
+                    # Single layer case: input directly to output
+                    out_dim = out_channels
+                    heads = 1  # Single head for single layer
+                    concat = False
+                else:
+                    # Multi-layer case: first layer outputs K
+                    out_dim = hidden_channels  # K (first layer)
+                    heads = num_heads
+                    concat = True
+            elif i == num_layers - 1:
+                # Last layer: previous layer with concatenated heads -> output classes
+                prev_layer_output = hidden_channels * i if i > 1 else hidden_channels
+                in_dim = prev_layer_output * num_heads  # Previous layer with heads
+                out_dim = out_channels
+                heads = 1  # Single head for output
+                concat = False
+            else:
+                # Intermediate layers
+                prev_layer_output = hidden_channels * i if i > 1 else hidden_channels
+                in_dim = prev_layer_output * num_heads  # Previous layer with heads
+                out_dim = hidden_channels * (i + 1)  # K*(i+1)
+                heads = num_heads
+                concat = True
+            self.layer_dims.append((in_dim, out_dim, heads, concat))
+            
+        # Debug print layer dimensions
+        print(f"Progressive width GAT layer dimensions:")
+        for i, (in_dim, out_dim, heads, concat) in enumerate(self.layer_dims):
+            final_out = out_dim * heads if concat else out_dim
+            print(f"  Layer {i+1}: {in_dim} -> {out_dim} (heads={heads}, concat={concat}, final_out={final_out})")
+        print(f"Expected output classes: {out_channels}")
+        
+        # Initialize GAT layers with progressive widths
         self.gat_layers = torch.nn.ModuleList()
-        self.gat_layers.append(GATConv(num_features, hidden_channels, heads=num_heads))
-        for i in range(num_layers - 2):
-            self.gat_layers.append(GATConv(hidden_channels * num_heads, hidden_channels, heads=num_heads))
-        self.gat_layers.append(GATConv(hidden_channels * num_heads, out_channels, heads=num_heads, concat=False))
+        for in_dim, out_dim, heads, concat in self.layer_dims:
+            self.gat_layers.append(GATConv(in_dim, out_dim, heads=heads, concat=concat))
         
         if self.skip:
-            # Create a process layer.
-            self.preprocess = create_ffn(num_features, hidden_channels * num_heads, dropout)
-            
-        #if self.use_ppr:
-            #self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
-            #torch.nn.init.xavier_uniform_(self.ppr_weight)
+            # Create projection layers for ResGCN-style skip connections
+            self.preprocess = torch.nn.ModuleList()
+            for i, (in_dim, out_dim, heads, concat) in enumerate(self.layer_dims):
+                final_out_dim = out_dim * heads if concat else out_dim
+                
+                if i == 0:
+                    # First layer: project input to match first layer output
+                    proj_in = num_features
+                    proj_out = final_out_dim
+                else:
+                    # Other layers: project previous layer output to current layer output
+                    prev_out = self.layer_dims[i-1][1]  # Previous out_dim
+                    prev_heads = self.layer_dims[i-1][2]  # Previous heads
+                    prev_concat = self.layer_dims[i-1][3]  # Previous concat
+                    proj_in = prev_out * prev_heads if prev_concat else prev_out
+                    proj_out = final_out_dim
+                
+                if proj_in == proj_out:
+                    self.preprocess.append(torch.nn.Identity())
+                else:
+                    self.preprocess.append(create_ffn(proj_in, proj_out, dropout))
             
     def forward(self, x, edge_index, ppr_matrix=None):
-        
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
         if self.use_ppr and ppr_matrix is not None:
             ppr_features = ppr_matrix @ x
-            #ppr_features = ppr_features @ self.ppr_weight
         
-        for layer in self.gat_layers[:-1]:
-            x = layer(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Store previous layer output for ResGCN-style skip connections
+        prev_layer = x
+        
+        for i, layer in enumerate(self.gat_layers):
+            h = layer(prev_layer, edge_index)
+            
+            # Apply ResGCN-style skip connection with projection
             if self.skip:
-                x = x + x_skip
-        x = self.gat_layers[-1](x, edge_index)
+                if i == 0:
+                    # First layer: project input to match layer output
+                    skip_connection = self.preprocess[i](x)
+                else:
+                    # Other layers: project previous layer to match current layer output
+                    skip_connection = self.preprocess[i](prev_layer)
+                
+                h = h + skip_connection
+            
+            # Apply activation and dropout (except for last layer)
+            if i < len(self.gat_layers) - 1:
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            
+            # Update previous layer for next iteration
+            prev_layer = h
         
         # Combine with PPR features
         if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
+            if h.size(1) != ppr_features.size(1):
+                ppr_proj = torch.nn.Linear(ppr_features.size(1), h.size(1)).to(h.device)
+                ppr_features = ppr_proj(ppr_features)
+            h = h + ppr_features
         
-        return F.log_softmax(x, dim=1)
+        return F.log_softmax(h, dim=1)
     
     def forward_2(self, x, edge_index, ppr_matrix=None):
-        
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
         if self.use_ppr and ppr_matrix is not None:
             ppr_features = ppr_matrix @ x
-            #ppr_features = ppr_features @ self.ppr_weight
         
-        for layer in self.gat_layers[:-1]:
-            x = layer(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+        # Store previous layer output for ResGCN-style skip connections
+        prev_layer = x
+        
+        for i, layer in enumerate(self.gat_layers):
+            h = layer(prev_layer, edge_index)
+            
+            # Apply ResGCN-style skip connection with projection
             if self.skip:
-                x = x + x_skip
-        x = self.gat_layers[-1](x, edge_index)
+                if i == 0:
+                    # First layer: project input to match layer output
+                    skip_connection = self.preprocess[i](x)
+                else:
+                    # Other layers: project previous layer to match current layer output
+                    skip_connection = self.preprocess[i](prev_layer)
+                
+                h = h + skip_connection
+            
+            # Apply activation and dropout (except for last layer)
+            if i < len(self.gat_layers) - 1:
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            
+            # Update previous layer for next iteration
+            prev_layer = h
         
         # Combine with PPR features
         if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
+            if h.size(1) != ppr_features.size(1):
+                ppr_proj = torch.nn.Linear(ppr_features.size(1), h.size(1)).to(h.device)
+                ppr_features = ppr_proj(ppr_features)
+            h = h + ppr_features
         
-        return x
-    
+        return h
+
 class GraphSAGE(torch.nn.Module):
     """
-        GraphSAGE model.
-
-        Parameters:
-            num_features (int): Number of input features.
-            hidden_channels (int): Number of hidden channels.
-            out_channels (int): Number of output channels.
-            num_layers (int, optional): Number of GraphSAGE layers. Default is 2.
-            activation (callable, optional): Activation function. Default is F.relu.
-            dropout (float, optional): Dropout rate. Default is 0.0.
-
-        Returns:
-            torch.Tensor: Output tensor after passing through the GraphSAGE layers.
+        GraphSAGE model with progressive width and ResGCN-style skip connections.
     """
 
     def __init__(self, **kwargs):
@@ -238,7 +353,7 @@ class GraphSAGE(torch.nn.Module):
         dropout = kwargs.get("dropout", 0.0)
         skip = kwargs.get("skip", False)
         use_ppr = kwargs.get("use_ppr", False)
-        hidden_channels = kwargs.get("hidden_channels", 64)
+        hidden_channels = kwargs.get("hidden_channels", 64)  # Base K
         
         self.num_features = num_features
         self.hidden_channels = hidden_channels
@@ -249,75 +364,140 @@ class GraphSAGE(torch.nn.Module):
         self.skip = skip
         self.use_ppr = use_ppr
         
-        # Initialize the first GraphSAGE layer
+        # Calculate progressive layer dimensions - FIXED for single layer case
+        self.layer_dims = []
+        for i in range(num_layers):
+            if i == 0:
+                in_dim = num_features
+                if num_layers == 1:
+                    # Single layer case: input directly to output
+                    out_dim = out_channels
+                else:
+                    # Multi-layer case: first layer outputs K
+                    out_dim = hidden_channels  # K (first layer)
+            elif i == num_layers - 1:
+                # Last layer: previous layer width -> output classes
+                in_dim = hidden_channels * i  # K*i from previous layer
+                out_dim = out_channels
+            else:
+                in_dim = hidden_channels * i  # K*i
+                out_dim = hidden_channels * (i + 1)  # K*(i+1)
+            self.layer_dims.append((in_dim, out_dim))
+            
+        # Debug print layer dimensions
+        print(f"Progressive width GraphSAGE layer dimensions:")
+        for i, (in_dim, out_dim) in enumerate(self.layer_dims):
+            print(f"  Layer {i+1}: {in_dim} -> {out_dim}")
+        print(f"Expected output classes: {out_channels}")
+        
+        # Initialize the GraphSAGE layers with progressive widths
         self.convs = torch.nn.ModuleList()
-        self.convs.append(SAGEConv(num_features, hidden_channels))
-
-        # Add intermediate GraphSAGE layers if needed
-        for _ in range(num_layers - 2):
-            self.convs.append(SAGEConv(hidden_channels, hidden_channels))
-
-        # Output layer
-        self.convs.append(SAGEConv(hidden_channels, out_channels))
+        for in_dim, out_dim in self.layer_dims:
+            self.convs.append(SAGEConv(in_dim, out_dim))
 
         if self.skip:
-            # Create a process layer for skip connections
-            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
+            # Create projection layers for ResGCN-style skip connections
+            self.preprocess = torch.nn.ModuleList()
+            for i, (in_dim, out_dim) in enumerate(self.layer_dims):
+                if i == 0:
+                    # First layer: project input to match first layer output
+                    proj_in = num_features
+                    proj_out = out_dim
+                else:
+                    # Other layers: project previous layer output to current layer output
+                    proj_in = self.layer_dims[i-1][1]  # Previous layer's output dim
+                    proj_out = out_dim                 # Current layer's output dim
+                
+                if proj_in == proj_out:
+                    self.preprocess.append(torch.nn.Identity())
+                else:
+                    self.preprocess.append(create_ffn(proj_in, proj_out, dropout))
             
         if self.use_ppr:
             self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
             torch.nn.init.xavier_uniform_(self.ppr_weight)
 
     def forward(self, x, edge_index, ppr_matrix=None):
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
         if self.use_ppr and ppr_matrix is not None:
             ppr_features = ppr_matrix @ x
             ppr_features = ppr_features @ self.ppr_weight
-        # Apply the GraphSAGE layers and the activation function
-        for conv in self.convs[:-1]:
-            x = conv(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            if self.skip:
-                x = x + x_skip
-
-        # Output layer (no activation applied here)
-        x = self.convs[-1](x, edge_index)
+            
+        # Store previous layer output for ResGCN-style skip connections
+        prev_layer = x
         
+        # Apply the GraphSAGE layers with progressive width and skip connections
+        for i, conv in enumerate(self.convs):
+            h = conv(prev_layer, edge_index)
+            
+            # Apply ResGCN-style skip connection with projection
+            if self.skip:
+                if i == 0:
+                    # First layer: project input to match layer output
+                    skip_connection = self.preprocess[i](x)
+                else:
+                    # Other layers: project previous layer to match current layer output
+                    skip_connection = self.preprocess[i](prev_layer)
+                
+                h = h + skip_connection
+            
+            # Apply activation and dropout (except for last layer)
+            if i < len(self.convs) - 1:
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            
+            # Update previous layer for next iteration
+            prev_layer = h
+
         # Combine with PPR features
         if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
+            if h.size(1) != ppr_features.size(1):
+                ppr_proj = torch.nn.Linear(ppr_features.size(1), h.size(1)).to(h.device)
+                ppr_features = ppr_proj(ppr_features)
+            h = h + ppr_features
 
-        return F.log_softmax(x, dim=1)
+        return F.log_softmax(h, dim=1)
     
     def forward_2(self, x, edge_index, ppr_matrix=None):
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
         if self.use_ppr and ppr_matrix is not None:
             ppr_features = ppr_matrix @ x
             ppr_features = ppr_features @ self.ppr_weight
-        # Apply the GraphSAGE layers and the activation function
-        for conv in self.convs[:-1]:
-            x = conv(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            if self.skip:
-                x = x + x_skip
-
-        # Output layer (no activation applied here)
-        x = self.convs[-1](x, edge_index)
+            
+        # Store previous layer output for ResGCN-style skip connections
+        prev_layer = x
         
+        # Apply the GraphSAGE layers with progressive width and skip connections
+        for i, conv in enumerate(self.convs):
+            h = conv(prev_layer, edge_index)
+            
+            # Apply ResGCN-style skip connection with projection
+            if self.skip:
+                if i == 0:
+                    # First layer: project input to match layer output
+                    skip_connection = self.preprocess[i](x)
+                else:
+                    # Other layers: project previous layer to match current layer output
+                    skip_connection = self.preprocess[i](prev_layer)
+                
+                h = h + skip_connection
+            
+            # Apply activation and dropout (except for last layer)
+            if i < len(self.convs) - 1:
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+            
+            # Update previous layer for next iteration
+            prev_layer = h
+
         # Combine with PPR features
         if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
+            if h.size(1) != ppr_features.size(1):
+                ppr_proj = torch.nn.Linear(ppr_features.size(1), h.size(1)).to(h.device)
+                ppr_features = ppr_proj(ppr_features)
+            h = h + ppr_features
 
-        return x
-    
+        return h
 
-    
+
 class GPRGNN(torch.nn.Module):
     def __init__(self, **kwargs):
         super(GPRGNN, self).__init__()
@@ -465,120 +645,7 @@ class GCNLayer(MessagePassing):
 
     def update(self, aggr_out):
         return aggr_out
-'''
-class GCNGPP(torch.nn.Module):
-    def __init__(self, num_features, hidden_channels, out_channels, num_layers=2, activation=F.relu, dropout=0.0, skip=False, use_ppr=False):
-        super(GCNGPP, self).__init__()
-        self.num_features = num_features
-        self.num_layers = num_layers
-        self.activation = activation
-        self.dropout = dropout
-        self.skip = skip
-        self.use_ppr = use_ppr
-        # Initialize the first convolutional layer
-        
-        self.convs = torch.nn.ModuleList()
-        self.batch_norms = torch.nn.ModuleList()
-        
-        self.convs.append(GCNConv(num_features, hidden_channels))
-        self.batch_norms.append(torch.nn.BatchNorm1d(hidden_channels))
-        
-        
-        # Add intermediate convolutional layers if needed
-        for _ in range(num_layers - 2):
-            self.convs.append(GCNConv(hidden_channels, hidden_channels))
-            self.batch_norms.append(torch.nn.BatchNorm1d(hidden_channels))
 
-        # Output layer
-        self.convs.append(GCNConv(hidden_channels, hidden_channels))
-        self.batch_norms.append(torch.nn.BatchNorm1d(hidden_channels))
-        
-        if self.skip:
-            # Create a process layer.
-            self.preprocess = create_ffn(num_features, hidden_channels, dropout)
-            
-        if self.use_ppr:
-            self.ppr_weight = torch.nn.Parameter(torch.Tensor(num_features, hidden_channels))
-            torch.nn.init.xavier_uniform_(self.ppr_weight)
-        # Define GCN layers
-        
-        # Define a fully connected layer for graph classification
-        self.fc = torch.nn.Linear(hidden_channels, out_channels)
-        
-
-    def forward(self, data, ppr_matrix=None):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-
-        # Apply GCN layers
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
-        if self.use_ppr and ppr_matrix is not None:
-            ppr_features = ppr_matrix @ x
-            ppr_features = ppr_features @ self.ppr_weight    
-            
-        # Apply the GCN layers and the activation function
-        for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = self.batch_norms[i](x)
-            if self.skip:                
-                x = x + x_skip
-            
-        
-        # Output layer (no activation applied here)
-        x = self.convs[-1](x, edge_index)
-        x = self.batch_norms[i](x)
-        
-        # Combine with PPR features
-        if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
-            
-        
-        # Global mean pooling to aggregate node embeddings
-        x = global_mean_pool(x, batch)
-        #x = global_max_pool(x, batch)
-
-        # Fully connected layer for graph classification
-        x = self.fc(x)
-        return x
-    
-    def forward_2(self, data, ppr_matrix=None):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-
-        # Apply GCN layers
-        if self.skip:
-            x_skip = self.preprocess(x)
-            
-        if self.use_ppr and ppr_matrix is not None:
-            ppr_features = ppr_matrix @ x
-            ppr_features = ppr_features @ self.ppr_weight    
-            
-        # Apply the GCN layers and the activation function
-        for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, edge_index)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = self.batch_norms[i](x)
-            if self.skip:                
-                x = x + x_skip
-        
-        # Output layer (no activation applied here)
-        x = self.convs[-1](x, edge_index)
-        x = self.batch_norms[i](x)
-        
-        # Combine with PPR features
-        if self.use_ppr and ppr_matrix is not None:
-            x = x + ppr_features
-
-        # Global mean pooling to aggregate node embeddings
-        x = global_mean_pool(x, batch)
-
-        # Fully connected layer for graph classification
-        x = self.fc(x)
-        return x
-'''
 class GSGPP(torch.nn.Module):
     def __init__(self, **kwargs):
         super(GSGPP, self).__init__()
@@ -967,6 +1034,3 @@ def create_ffn(num_features, hidden_channels, dropout_rate):
             layers.append(torch.nn.Dropout(dropout_rate))
 
         return torch.nn.Sequential(*layers)
-
-# 
-

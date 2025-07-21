@@ -257,10 +257,31 @@ class GraphDataset:
     def get_mutag(self):
         # Load MUTAG dataset
         dataset = TUDataset(root="data/TUDataset", name="MUTAG")
+        
+        # get the number of unique classes
+        num_classes = len(set(dataset.y.numpy()))
 
         # Split the dataset into train, validation, and test sets
         train_idx, test_idx = train_test_split(range(len(dataset)), test_size=self.test_size, random_state=42)
         train_idx, valid_idx = train_test_split(train_idx, test_size=self.val_size, random_state=42)
+    
+        train_idx_labels = dataset[train_idx].y
+        all_sample_idx = []
+        train_idx_samples = []
+        
+        # get num_train_per_class for each class in train_idx_labels
+        for i in range(num_classes):
+            idx = (train_idx_labels == i).nonzero().view(-1)
+            idx = idx[torch.randperm(idx.size(0))]
+            for j in idx[:self.num_train_per_class]:
+                all_sample_idx.append(j)
+        
+        # sort the indices
+        all_sample_idx.sort()
+        for i in all_sample_idx:
+            train_idx_samples.append(train_idx[i])
+        
+        train_idx = train_idx_samples    
 
         train_dataset = dataset[train_idx]
         valid_dataset = dataset[valid_idx]
