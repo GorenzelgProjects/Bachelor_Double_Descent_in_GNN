@@ -1,0 +1,50 @@
+{
+    "model_type": "GCN",
+    "dataset": "cora",
+    "layer_range": {
+        "min": 7,
+        "max": 8,
+        "step": 1
+    },
+    "hidden_channels_range": {
+        "min": 1,
+        "max": 64,
+        "step": 1
+    },
+    "epoch_range": {
+        "min": 4000,
+        "max": 4000,
+        "step": 50
+    },
+    "activation_options": ["relu"],
+    "dropout": 0.5,
+    "num_heads": 2,
+    "label_noise": 0.0,
+    "save_interval": 50,
+    "learning_rate": 0.01,
+    "batch_size": 32,
+    "data_shuffle": "True",
+    "test_size": 0.2,
+    "val_size": 0.1,
+    "random_seed": 42,
+    "optimizer": "adam",
+    "loss": "cross_entropy",
+    "output_path": "madreg_78",
+    "ppnp": "False",
+    "K": 10,
+    "alpha": 0.1,
+    "dprate": 0.5,
+    "skip": "True",
+    "ppr": "True",
+    "raw_data_path": "None",
+    "num_train_per_class": 20,
+    "use_madreg": "True",
+    "lambda_reg": 0.1,
+    "progressive_width": true,
+    "base_lr_scaling": false,
+    "gradient_clipping": 1.0,
+    "warmup_epochs_ratio": 0.0,
+    "start_epochs_to_save": 10,
+    "train_log_frequency": 10,
+    "mad_calculation_frequency": 10
+}
